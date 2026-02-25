@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden-eso-bridge
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-eso-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vaultwarden-eso-bridge
+    spec:
+      containers:
+        - name: bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.backend.bwCli.enabled }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              desired_bw_version="{{ .Values.backend.bwCli.cliVersion }}"
+              current_bw_version=""
+              if command -v bw >/dev/null 2>&1; then
+                current_bw_version="$(bw --version 2>/dev/null || true)"
+              fi
+              if [ -z "${current_bw_version}" ] || [ "${current_bw_version}" != "${desired_bw_version}" ]; then
+                # Network and mirror hiccups can be transient; keep retrying during startup.
+                until apk add --no-cache nodejs npm >/dev/null 2>&1; do
+                  sleep 10
+                done
+                until npm install -g "@bitwarden/cli@${desired_bw_version}" >/dev/null 2>&1; do
+                  sleep 10
+                done
+              fi
+              exec python /app/bridge_server.py
+          {{- else }}
+          command: ["python", "/app/bridge_server.py"]
+          {{- end }}
+          env:
+            - name: BRIDGE_PORT
+              value: "{{ .Values.service.port }}"
+            - name: BRIDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.tokenKey }}
+            - name: BACKEND_MODE
+              value: "{{ .Values.backend.mode }}"
+            - name: ITEM_NAME_TEMPLATE
+              value: "{{ .Values.backend.itemNameTemplate }}"
+            - name: VAULTWARDEN_SERVER
+              value: "{{ .Values.backend.vaultwarden.server }}"
+            - name: VAULTWARDEN_ORGANIZATION_ID
+              value: "{{ .Values.backend.vaultwarden.organizationId }}"
+            - name: VAULTWARDEN_FOLDER
+              value: "{{ .Values.backend.vaultwarden.folderName }}"
+          {{- if eq .Values.backend.mode "mock" }}
+            - name: MOCK_SECRETS_JSON
+              value: {{ .Values.backend.mockSecrets | toJson | quote }}
+          {{- end }}
+          {{- if .Values.backend.bwCli.enabled }}
+            - name: BW_SERVER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.bwCli.existingSecret }}
+                  key: {{ .Values.backend.bwCli.serverKey }}
+                  optional: true
+            - name: BW_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.bwCli.existingSecret }}
+                  key: {{ .Values.backend.bwCli.emailKey }}
+            - name: BW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.bwCli.existingSecret }}
+                  key: {{ .Values.backend.bwCli.passwordKey }}
+          {{- if .Values.backend.bwCli.sessionKey }}
+            - name: BW_SESSION
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.bwCli.existingSecret }}
+                  key: {{ .Values.backend.bwCli.sessionKey }}
+                  optional: true
+          {{- end }}
+            - name: BW_ITEM_CACHE_TTL_SECONDS
+              value: "{{ .Values.backend.bwCli.itemCacheTtlSeconds }}"
+            - name: BW_COMMAND_TIMEOUT_SECONDS
+              value: "{{ .Values.backend.bwCli.commandTimeoutSeconds }}"
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- if and .Values.backend.bwCli.enabled .Values.backend.bwCli.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: {{ .Values.backend.bwCli.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.backend.bwCli.startupProbe.failureThreshold }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ ternary 45 5 .Values.backend.bwCli.enabled }}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ ternary 90 10 .Values.backend.bwCli.enabled }}
+            periodSeconds: 20
+          volumeMounts:
+            - name: bridge-script
+              mountPath: /app
+              readOnly: true
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+      volumes:
+        - name: bridge-script
+          configMap:
+            name: vaultwarden-eso-bridge-script
+            defaultMode: 0555

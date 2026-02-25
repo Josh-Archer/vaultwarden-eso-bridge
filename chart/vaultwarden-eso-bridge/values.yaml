@@ -1,0 +1,39 @@
+replicaCount: 1
+
+image:
+  repository: python
+  tag: "3.14-alpine"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+auth:
+  existingSecret: vaultwarden-bridge-auth
+  tokenKey: token
+
+backend:
+  mode: mock
+  itemNameTemplate: "{namespace}/{secret}"
+  vaultwarden:
+    server: ""
+    organizationId: ""
+    folderName: "k8s-secrets"
+  bwCli:
+    enabled: false
+    cliVersion: "2025.12.0"
+    existingSecret: vaultwarden-bridge-bw
+    serverKey: BW_SERVER
+    emailKey: BW_EMAIL
+    passwordKey: BW_PASSWORD
+    sessionKey: ""
+    itemCacheTtlSeconds: 120
+    commandTimeoutSeconds: 120
+    startupProbe:
+      enabled: true
+      periodSeconds: 10
+      failureThreshold: 60
+  mockSecrets: {}
+
+resources: {}

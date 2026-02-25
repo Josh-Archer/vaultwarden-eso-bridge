@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vaultwarden-eso-bridge-script
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+data:
+  bridge_server.py: |
+{{ .Files.Get "files/bridge_server.py" | indent 4 }}

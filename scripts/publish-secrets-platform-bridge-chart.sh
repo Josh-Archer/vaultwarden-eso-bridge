@@ -15,7 +15,7 @@ set -euo pipefail
 #   - Optional GHCR_REPOSITORY override (default: josh-archer/secrets-platform-charts)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CHART_DIR="${REPO_ROOT}/grok-servaar/infra/secrets-platform/bridge/chart/vaultwarden-eso-bridge"
+CHART_DIR="${REPO_ROOT}/chart/vaultwarden-eso-bridge"
 OUTPUT_DIR="${REPO_ROOT}/.artifacts/helm"
 GHCR_REPOSITORY="${GHCR_REPOSITORY:-josh-archer/secrets-platform-charts}"
 

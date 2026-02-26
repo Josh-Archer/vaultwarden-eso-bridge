@@ -1,3 +1,6 @@
+{{- if and (ne .Values.service.type "ClusterIP") (not .Values.exposure.allowExternalService) }}
+{{- fail "Refusing external service exposure: set exposure.allowExternalService=true to use service.type other than ClusterIP." }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -5,6 +8,10 @@ metadata:
   labels:
     app.kubernetes.io/name: vaultwarden-eso-bridge
     app.kubernetes.io/part-of: secrets-platform
+  {{- with .Values.service.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.service.type }}
   selector:

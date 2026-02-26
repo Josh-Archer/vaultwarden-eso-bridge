@@ -1,0 +1,32 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vaultwarden-eso-bridge
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-eso-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    -
+{{- if or .Values.networkPolicy.allowSameNamespace (gt (len .Values.networkPolicy.allowedPeers) 0) }}
+      from:
+{{- if .Values.networkPolicy.allowSameNamespace }}
+        - podSelector: {}
+{{- end }}
+{{- range .Values.networkPolicy.allowedPeers }}
+        -
+{{ toYaml . | indent 10 }}
+{{- end }}
+{{- else }}
+      from: []
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+{{- end }}

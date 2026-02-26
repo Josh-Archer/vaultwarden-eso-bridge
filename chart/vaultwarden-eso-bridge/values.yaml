@@ -8,9 +8,15 @@ image:
 service:
   type: ClusterIP
   port: 8080
+  annotations: {}
+
+exposure:
+  # Keep internal-only by default. To expose externally, set this true and
+  # explicitly change service.type to NodePort/LoadBalancer.
+  allowExternalService: false
 
 auth:
-  existingSecret: vaultwarden-bridge-auth
+  existingSecret: eso-bridge-auth
   tokenKey: token
 
 backend:
@@ -23,7 +29,7 @@ backend:
   bwCli:
     enabled: false
     cliVersion: "2025.12.0"
-    existingSecret: vaultwarden-bridge-bw
+    existingSecret: eso-bridge-bw
     serverKey: BW_SERVER
     emailKey: BW_EMAIL
     passwordKey: BW_PASSWORD
@@ -37,3 +43,11 @@ backend:
   mockSecrets: {}
 
 resources: {}
+
+networkPolicy:
+  enabled: false
+  # When true, allow same-namespace pods to reach the bridge.
+  allowSameNamespace: true
+  # Additional ingress peers. Each item may include namespaceSelector,
+  # podSelector, and/or ipBlock.
+  allowedPeers: []

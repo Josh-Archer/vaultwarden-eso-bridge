@@ -1,0 +1,72 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    tags:
+      - "vaultwarden-eso-bridge-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional semver override (for example 0.1.2)"
+        required: false
+        type: string
+      dry_run:
+        description: "Package/lint only; skip GHCR push"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GHCR_USERNAME: ${{ github.actor }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Resolve publish arguments
+        id: args
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_INPUT="${{ inputs.version || '' }}"
+          DRY_RUN_INPUT="${{ inputs.dry_run || false }}"
+          RESOLVED_VERSION=""
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == vaultwarden-eso-bridge-v* ]]; then
+            RESOLVED_VERSION="${GITHUB_REF_NAME#vaultwarden-eso-bridge-v}"
+          elif [[ -n "${VERSION_INPUT}" ]]; then
+            RESOLVED_VERSION="${VERSION_INPUT}"
+          fi
+
+          {
+            echo "version=${RESOLVED_VERSION}"
+            echo "dry_run=${DRY_RUN_INPUT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=()
+
+          if [[ -n "${{ steps.args.outputs.version }}" ]]; then
+            ARGS+=(--version "${{ steps.args.outputs.version }}")
+          fi
+
+          if [[ "${{ steps.args.outputs.dry_run }}" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+
+          bash ./scripts/publish-secrets-platform-bridge-chart.sh "${ARGS[@]}"

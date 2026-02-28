@@ -67,6 +67,7 @@ jobs:
           if [[ -z "${GHCR_REPOSITORY:-}" ]]; then
             GHCR_REPOSITORY="${GITHUB_REPOSITORY}"
           fi
+          GHCR_REPOSITORY="${GHCR_REPOSITORY,,}"
 
           # Prefer a dedicated PAT when configured; otherwise use workflow token.
           if [[ -n "${GHCR_PUBLISH_TOKEN:-}" ]]; then

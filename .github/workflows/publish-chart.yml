@@ -25,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GHCR_USERNAME: ${{ github.actor }}
-      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -56,8 +55,28 @@ jobs:
 
       - name: Publish chart
         shell: bash
+        env:
+          GHCR_REPOSITORY: ${{ vars.GHCR_REPOSITORY }}
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Default to publishing under the current repository so GITHUB_TOKEN
+          # has write access. Allow repository-level override via GHCR_REPOSITORY var.
+          if [[ -z "${GHCR_REPOSITORY:-}" ]]; then
+            GHCR_REPOSITORY="${GITHUB_REPOSITORY}"
+          fi
+
+          # Prefer a dedicated PAT when configured; otherwise use workflow token.
+          if [[ -n "${GHCR_PUBLISH_TOKEN:-}" ]]; then
+            GHCR_TOKEN="${GHCR_PUBLISH_TOKEN}"
+          else
+            GHCR_TOKEN="${GITHUB_TOKEN}"
+          fi
+
+          export GHCR_REPOSITORY
+          export GHCR_TOKEN
 
           ARGS=()
 

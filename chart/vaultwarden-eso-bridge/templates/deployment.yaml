@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: bridge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python", "/app/bridge_server.py"]
           env:

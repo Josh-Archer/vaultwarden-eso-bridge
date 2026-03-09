@@ -6,7 +6,7 @@ set -euo pipefail
 #   as an OCI artifact for external consumption.
 #
 # Usage:
-#   ./scripts/publish-secrets-platform-bridge-chart.sh [--version <semver>] [--dry-run]
+#   ./scripts/publish-secrets-platform-bridge-chart.sh [--version <semver>] [--app-version <semver>] [--dry-run]
 #
 # Prerequisites:
 #   - helm v3 installed
@@ -20,12 +20,17 @@ OUTPUT_DIR="${REPO_ROOT}/.artifacts/helm"
 GHCR_REPOSITORY="${GHCR_REPOSITORY:-josh-archer/secrets-platform-charts}"
 
 VERSION_OVERRIDE=""
+APP_VERSION_OVERRIDE=""
 DRY_RUN="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)
       VERSION_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --app-version)
+      APP_VERSION_OVERRIDE="${2:-}"
       shift 2
       ;;
     --dry-run)
@@ -56,14 +61,27 @@ if [[ ! "${PACKAGE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ 
   exit 1
 fi
 
+CHART_APP_VERSION="$(awk '/^appVersion:[[:space:]]+/ {gsub(/"/, "", $2); print $2; exit}' "${CHART_DIR}/Chart.yaml")"
+if [[ -z "${CHART_APP_VERSION}" ]]; then
+  echo "ERROR: could not resolve appVersion from Chart.yaml."
+  exit 1
+fi
+
+PACKAGE_APP_VERSION="${APP_VERSION_OVERRIDE:-${CHART_APP_VERSION}}"
+if [[ ! "${PACKAGE_APP_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
+  echo "ERROR: app version must be semver-compatible (got: ${PACKAGE_APP_VERSION})."
+  exit 1
+fi
+
 echo "Linting bridge chart..."
 helm lint "${CHART_DIR}"
 
 mkdir -p "${OUTPUT_DIR}"
-echo "Packaging bridge chart version ${PACKAGE_VERSION}..."
+echo "Packaging bridge chart version ${PACKAGE_VERSION} with appVersion ${PACKAGE_APP_VERSION}..."
 PACKAGE_FILE="$(
   helm package "${CHART_DIR}" \
     --version "${PACKAGE_VERSION}" \
+    --app-version "${PACKAGE_APP_VERSION}" \
     --destination "${OUTPUT_DIR}" \
   | awk '/Successfully packaged chart and saved it to:/ {print $NF}'
 )"

@@ -132,7 +132,7 @@ class BridgeUnitTests(unittest.TestCase):
                     folder_name="",
                     org_id="",
                     item_template="{namespace}/{secret}",
-                    bw_server="https://vault.archer.casa",
+                    bw_server="https://vault.example.internal",
                     bw_email="user@example.com",
                     bw_password="password",
                     bw_session="",
@@ -141,7 +141,7 @@ class BridgeUnitTests(unittest.TestCase):
                 )
 
         self.assertEqual(backend.session, "fresh-session")
-        self.assertEqual(calls[0][0], ["config", "server", "https://vault.archer.casa"])
+        self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
         self.assertFalse(calls[0][1]["include_session"])
 
     def test_bw_cli_backend_caches_item_lookups(self):

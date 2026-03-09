@@ -112,6 +112,38 @@ class BridgeUnitTests(unittest.TestCase):
                     self.assertIsInstance(backend, bridge.BwCliBackend)
                     self.assertEqual(backend.session, "preseeded-session")
 
+    def test_bw_cli_backend_configures_server_before_login(self):
+        calls = []
+
+        def _fake_run_bw_raw(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["config", "server"]:
+                return ""
+            if args[:2] == ["login", "user@example.com"]:
+                return "fresh-session"
+            if args == ["sync"]:
+                return ""
+            raise AssertionError(f"unexpected bw args: {args}")
+
+        with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
+            with patch.object(bridge.BwCliBackend, "_run_bw_raw", side_effect=_fake_run_bw_raw):
+                backend = bridge.BwCliBackend(
+                    bw_path="bw",
+                    folder_name="",
+                    org_id="",
+                    item_template="{namespace}/{secret}",
+                    bw_server="https://vault.archer.casa",
+                    bw_email="user@example.com",
+                    bw_password="password",
+                    bw_session="",
+                    cache_ttl_seconds=120,
+                    command_timeout_seconds=20,
+                )
+
+        self.assertEqual(backend.session, "fresh-session")
+        self.assertEqual(calls[0][0], ["config", "server", "https://vault.archer.casa"])
+        self.assertFalse(calls[0][1]["include_session"])
+
     def test_bw_cli_backend_caches_item_lookups(self):
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):

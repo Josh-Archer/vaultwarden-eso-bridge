@@ -3,6 +3,10 @@
 Reusable Helm chart and tests for a Vaultwarden/Bitwarden-backed
 External Secrets Operator (ESO) webhook bridge.
 
+The default chart image is a purpose-built container that already includes
+Python, Node.js, npm, and the pinned `bw` CLI version so the bridge does not
+perform package installs at pod startup.
+
 ## Security Defaults
 
 - Internal-only by default: chart `service.type` defaults to `ClusterIP`.

@@ -1,8 +1,8 @@
 replicaCount: 1
 
 image:
-  repository: python
-  tag: "3.14-alpine"
+  repository: ghcr.io/josh-archer/vaultwarden-eso-bridge
+  tag: "0.1.4"
   pullPolicy: IfNotPresent
 
 service:

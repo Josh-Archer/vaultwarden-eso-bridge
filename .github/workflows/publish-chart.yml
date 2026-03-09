@@ -21,19 +21,19 @@ permissions:
   packages: write
 
 jobs:
-  publish:
+  prepare:
     runs-on: ubuntu-latest
-    env:
-      GHCR_USERNAME: ${{ github.actor }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_repository: ${{ steps.meta.outputs.image_repository }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
-
       - name: Resolve publish arguments
-        id: args
+        id: meta
         shell: bash
         run: |
           set -euo pipefail
@@ -48,10 +48,59 @@ jobs:
             RESOLVED_VERSION="${VERSION_INPUT}"
           fi
 
+          IMAGE_TAG="${RESOLVED_VERSION}"
+          if [[ -z "${IMAGE_TAG}" ]]; then
+            IMAGE_TAG="$(awk '/^appVersion:/ {gsub(/"/, "", $2); print $2; exit}' chart/vaultwarden-eso-bridge/Chart.yaml)"
+          fi
+          IMAGE_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}"
+
           {
             echo "version=${RESOLVED_VERSION}"
             echo "dry_run=${DRY_RUN_INPUT}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "image_repository=${IMAGE_REPOSITORY}"
           } >> "${GITHUB_OUTPUT}"
+
+  publish-image:
+    runs-on: ubuntu-latest
+    needs: prepare
+    env:
+      GHCR_USERNAME: ${{ github.actor }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: ${{ needs.prepare.outputs.dry_run != 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ env.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ needs.prepare.outputs.dry_run != 'true' }}
+          tags: ${{ needs.prepare.outputs.image_repository }}:${{ needs.prepare.outputs.image_tag }}
+          build-args: |
+            BW_CLI_VERSION=2025.12.0
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - publish-image
+    env:
+      GHCR_USERNAME: ${{ github.actor }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
 
       - name: Publish chart
         shell: bash
@@ -81,11 +130,11 @@ jobs:
 
           ARGS=()
 
-          if [[ -n "${{ steps.args.outputs.version }}" ]]; then
-            ARGS+=(--version "${{ steps.args.outputs.version }}")
+          if [[ -n "${{ needs.prepare.outputs.version }}" ]]; then
+            ARGS+=(--version "${{ needs.prepare.outputs.version }}")
           fi
 
-          if [[ "${{ steps.args.outputs.dry_run }}" == "true" ]]; then
+          if [[ "${{ needs.prepare.outputs.dry_run }}" == "true" ]]; then
             ARGS+=(--dry-run)
           fi
 

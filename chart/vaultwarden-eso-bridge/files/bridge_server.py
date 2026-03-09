@@ -225,7 +225,17 @@ class BwCliBackend(SecretBackend):
             return False
         return isinstance(parsed, list)
 
+    def _configure_server(self) -> None:
+        """Point bw-cli at the configured Vaultwarden server before auth."""
+        if not self.bw_server:
+            return
+        self._run_bw_raw(
+            ["config", "server", self.bw_server],
+            include_session=False,
+        )
+
     def _bootstrap_auth(self) -> None:
+        self._configure_server()
         if self.session and self._validate_session(self.session):
             try:
                 self._run_bw_raw(["sync"])

@@ -17,37 +17,9 @@ spec:
     spec:
       containers:
         - name: bridge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.backend.bwCli.enabled }}
-          command:
-            - /bin/sh
-            - -c
-            - |
-              desired_bw_version="{{ .Values.backend.bwCli.cliVersion }}"
-              current_bw_version=""
-              if command -v bw >/dev/null 2>&1; then
-                current_bw_version="$(bw --version 2>/dev/null || true)"
-              fi
-              if [ -z "${current_bw_version}" ] || [ "${current_bw_version}" != "${desired_bw_version}" ]; then
-                until apk add --no-cache nodejs npm >/dev/null 2>&1; do
-                  sleep 10
-                done
-                until npm install -g "@bitwarden/cli@${desired_bw_version}" >/dev/null 2>&1; do
-                  sleep 10
-                done
-              fi
-
-              if [ -n "${VAULTWARDEN_SERVER:-}" ]; then
-                bw config server "${VAULTWARDEN_SERVER}" >/dev/null 2>&1 || true
-              elif [ -n "${BW_SERVER:-}" ]; then
-                bw config server "${BW_SERVER}" >/dev/null 2>&1 || true
-              fi
-
-              exec python /app/bridge_server.py
-          {{- else }}
           command: ["python", "/app/bridge_server.py"]
-          {{- end }}
           env:
             - name: BRIDGE_PORT
               value: "{{ .Values.service.port }}"

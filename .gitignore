@@ -3,3 +3,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 .artifacts/
+tests/integration/.certs/
+.bw-test-data/
+.bw-test-data2/
+.tmp-ssl/
+.tmp-bw-cli/

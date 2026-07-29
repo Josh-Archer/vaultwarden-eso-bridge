@@ -1,0 +1,91 @@
+# Ephemeral Vaultwarden + bridge stack for integration tests.
+# Orchestrated by scripts/test-eso-bridge-integration.sh (do not treat as a
+# long-lived deployment).
+#
+# Network layout:
+#   - vaultwarden serves HTTPS with a generated self-signed cert (bw CLI requires TLS)
+#   - bridge talks to https://vaultwarden with NODE_TLS_REJECT_UNAUTHORIZED=0
+#   - host probes http://localhost:${BRIDGE_HOST_PORT:-18081}
+
+name: vaultwarden-eso-bridge-integration
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.34.3
+    environment:
+      SIGNUPS_ALLOWED: "true"
+      # Rocket serves TLS on container port 80 (not 443).
+      DOMAIN: https://vaultwarden:80
+      I_REALLY_WANT_VOLATILE_STORAGE: "true"
+      ROCKET_TLS: '{certs="/ssl/cert.pem",key="/ssl/key.pem"}'
+    volumes:
+      - ./.certs:/ssl:ro
+    networks:
+      - integration
+
+  seed:
+    image: python:3.14-alpine
+    depends_on:
+      vaultwarden:
+        condition: service_started
+    environment:
+      VAULTWARDEN_URL: https://vaultwarden:80
+      BW_EMAIL: integration@example.com
+      BW_PASSWORD: "<example-only-integration-password>"
+      SEED_ITEM_NAME: default/demo-secret
+      SEED_FIELD_NAME: api-key
+      SEED_FIELD_VALUE: "<example-only-seed-field-value>"
+    volumes:
+      - ./seed_vaultwarden.py:/seed_vaultwarden.py:ro
+      - ./generate_certs.py:/generate_certs.py:ro
+    networks:
+      - integration
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir -q cryptography
+        python /seed_vaultwarden.py
+
+  bridge:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      vaultwarden:
+        condition: service_started
+    environment:
+      BRIDGE_TOKEN: example-only-bridge-token
+      BACKEND_MODE: bw-cli
+      VAULTWARDEN_SERVER: https://vaultwarden:80
+      BW_EMAIL: integration@example.com
+      BW_PASSWORD: "<example-only-integration-password>"
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      BRIDGE_PORT: "8080"
+      BW_COMMAND_TIMEOUT_SECONDS: "90"
+      BW_ITEM_CACHE_TTL_SECONDS: "30"
+      ITEM_NAME_TEMPLATE: "{namespace}/{secret}"
+      LOG_LEVEL: INFO
+    volumes:
+      - ../../chart/vaultwarden-eso-bridge/files/bridge_server.py:/app/bridge_server.py:ro
+    ports:
+      - "${BRIDGE_HOST_PORT:-18081}:8080"
+    networks:
+      - integration
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+networks:
+  integration:
+    driver: bridge

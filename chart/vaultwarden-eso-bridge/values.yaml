@@ -18,6 +18,9 @@ exposure:
 auth:
   existingSecret: eso-bridge-auth
   tokenKey: token
+  # Strict exact BRIDGE_TOKEN match by default. Set true only while migrating
+  # mis-encoded secrets that rely on quote-strip or base64 bearer variants.
+  legacyTokenVariants: false
 
 backend:
   mode: mock

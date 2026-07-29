@@ -17,8 +17,20 @@ perform package installs at pod startup.
 - No internet exposure: run this bridge only inside trusted cluster networks.
 - Bearer token limits: `BRIDGE_TOKEN` is a shared secret; rotate it regularly
   and scope network access so only ESO callers can reach the service.
+- Token matching is strict by default (exact `Authorization: Bearer` value
+  equals `BRIDGE_TOKEN`). Optional legacy quote/base64 expansion can mask
+  misconfigured secrets—keep `auth.legacyTokenVariants=false` unless migrating.
 - TLS recommendation: terminate TLS at your internal ingress/mesh/proxy if
   traffic crosses untrusted segments.
+
+## Bearer Token Matching
+
+| Mode | Env / chart | Accepted forms | Why |
+| --- | --- | --- | --- |
+| **Strict (default)** | `BRIDGE_TOKEN_LEGACY_VARIANTS=false` / `auth.legacyTokenVariants: false` | Exact equality of the bearer token string to `BRIDGE_TOKEN` (after normal header parse/trim of the `Bearer ` prefix) | Surfaces double-quoted, base64-encoded, or otherwise mis-set secrets immediately as `401` instead of appearing to work |
+| **Legacy expand** | `BRIDGE_TOKEN_LEGACY_VARIANTS=true` / `auth.legacyTokenVariants: true` | Exact match, **or** (1) one layer of surrounding `"`/`'` stripped from the presented token, **or** (2) one strict base64 decode of the raw/unquoted form decoded as UTF-8 | Temporary bridge for callers or secret stores that historically wrapped or encoded the shared token; emits a **warning** log when a non-exact variant matches |
+
+Prefer fixing the stored `BRIDGE_TOKEN` and client `Authorization` header so values match exactly, then leave legacy mode off.
 
 ## Required Secrets and Values
 

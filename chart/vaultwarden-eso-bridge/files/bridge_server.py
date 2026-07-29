@@ -202,11 +202,27 @@ def parse_positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def parse_bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean environment value with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 @dataclass
 class BridgeConfig:
     """Runtime config for bridge server."""
 
     token: str
+    token_legacy_variants: bool
     backend_mode: str
     item_name_template: str
     mock_secrets: Dict[str, Dict[str, str]]
@@ -522,7 +538,16 @@ def extract_bearer_token(header: str) -> Optional[str]:
 
 
 def expand_token_variants(token: str) -> Tuple[str, ...]:
-    """Return plausible token forms from a bearer value."""
+    """Return legacy token forms derived from a presented bearer value.
+
+    Used only when BRIDGE_TOKEN_LEGACY_VARIANTS is enabled. Forms:
+
+    1. Raw bearer value (after surrounding whitespace strip)
+    2. One layer of surrounding double or single quotes removed
+    3. One base64 decode (strict validate) of (1) or (2), UTF-8 decoded + strip
+
+    Strict mode does not use this helper; prefer exact BRIDGE_TOKEN equality.
+    """
     variants = []
     raw = token.strip()
     if raw:
@@ -542,6 +567,43 @@ def expand_token_variants(token: str) -> Tuple[str, ...]:
     return tuple(variants)
 
 
+def token_matches(
+    configured: str,
+    presented: Optional[str],
+    *,
+    legacy_variants: bool = False,
+) -> bool:
+    """Return True when the presented bearer token authorizes the request.
+
+    Strict mode (default, legacy_variants=False):
+      - Accept only exact equality of presented token to configured BRIDGE_TOKEN.
+      - Reject quoted and base64-encoded presentations even if they decode to
+        the configured secret. This surfaces misconfigured secrets early.
+
+    Legacy expand mode (legacy_variants=True):
+      - Accept exact match without logging.
+      - Also accept forms from expand_token_variants(presented) that equal
+        configured BRIDGE_TOKEN, and emit a warning when a non-exact form
+        is what matched (so operators can fix encoding mistakes).
+    """
+    if presented is None or not configured:
+        return False
+    if presented == configured:
+        return True
+    if not legacy_variants:
+        return False
+    variants = expand_token_variants(presented)
+    if configured in variants:
+        LOGGER.warning(
+            "bridge token matched via legacy variant expansion "
+            "(presented form differed from BRIDGE_TOKEN); "
+            "prefer exact bearer values and set BRIDGE_TOKEN_LEGACY_VARIANTS=false "
+            "once secrets are corrected"
+        )
+        return True
+    return False
+
+
 def build_config_from_env() -> BridgeConfig:
     """Build BridgeConfig from environment."""
     token = os.getenv("BRIDGE_TOKEN", "").strip()
@@ -549,6 +611,8 @@ def build_config_from_env() -> BridgeConfig:
         raise RuntimeError("BRIDGE_TOKEN is required")
     return BridgeConfig(
         token=token,
+        # Default false: strict exact match. Opt into legacy quote/base64 expand.
+        token_legacy_variants=parse_bool_env("BRIDGE_TOKEN_LEGACY_VARIANTS", False),
         backend_mode=os.getenv("BACKEND_MODE", "mock").strip(),
         item_name_template=os.getenv("ITEM_NAME_TEMPLATE", "{namespace}/{secret}").strip(),
         mock_secrets=load_mock_secrets(os.getenv("MOCK_SECRETS_JSON", "").strip()),
@@ -588,6 +652,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for secret lookups."""
 
     token: str = ""
+    token_legacy_variants: bool = False
     backend: SecretBackend
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -604,8 +669,12 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
-        token = extract_bearer_token(header)
-        return token is not None and self.token in expand_token_variants(token)
+        presented = extract_bearer_token(header)
+        return token_matches(
+            self.token,
+            presented,
+            legacy_variants=self.token_legacy_variants,
+        )
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
@@ -681,14 +750,22 @@ def run() -> None:
     backend = build_backend(config)
     port = int(os.getenv("BRIDGE_PORT", "8080"))
     LOGGER.info(
-        "starting vaultwarden bridge backend_mode=%s port=%s cache_ttl=%ss cmd_timeout=%ss",
+        "starting vaultwarden bridge backend_mode=%s port=%s cache_ttl=%ss "
+        "cmd_timeout=%ss token_legacy_variants=%s",
         config.backend_mode,
         port,
         config.bw_item_cache_ttl_seconds,
         config.bw_command_timeout_seconds,
+        config.token_legacy_variants,
     )
+    if config.token_legacy_variants:
+        LOGGER.warning(
+            "BRIDGE_TOKEN_LEGACY_VARIANTS enabled: quoted/base64 bearer forms "
+            "are accepted and may mask misconfigured secrets; prefer strict matching"
+        )
 
     BridgeRequestHandler.token = config.token
+    BridgeRequestHandler.token_legacy_variants = config.token_legacy_variants
     BridgeRequestHandler.backend = backend
     server = ThreadingHTTPServer(("0.0.0.0", port), BridgeRequestHandler)
     server.serve_forever()

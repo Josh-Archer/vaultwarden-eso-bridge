@@ -23,8 +23,132 @@ from urllib.parse import unquote, urlparse
 LOGGER = logging.getLogger(__name__)
 
 
-class SecretLookupError(RuntimeError):
-    """Raised when a secret/key cannot be resolved."""
+class BridgeError(RuntimeError):
+    """Base class for bridge operational errors with optional operator hints."""
+
+    code = "bridge_error"
+
+    def __init__(self, message: str, *, hint: str = ""):
+        super().__init__(message)
+        self.hint = hint
+
+    def log_message(self) -> str:
+        """Format message plus actionable next steps for operators."""
+        if self.hint:
+            return f"{self} | next_steps: {self.hint}"
+        return str(self)
+
+
+class SecretLookupError(BridgeError):
+    """Raised when a secret/item/key cannot be resolved."""
+
+    code = "secret_not_found"
+
+
+class AuthError(BridgeError):
+    """Raised when bw CLI authentication/session/unlock fails."""
+
+    code = "auth_error"
+
+
+class InvalidJsonError(BridgeError):
+    """Raised when bw CLI returns stdout that is not valid JSON."""
+
+    code = "invalid_json"
+
+
+class BwCliError(BridgeError):
+    """Raised for non-auth bw CLI command failures."""
+
+    code = "bw_cli_error"
+
+
+# (substring, error class, operator hint) — first match wins (case-insensitive).
+_BW_ERROR_RULES: Tuple[Tuple[str, type, str], ...] = (
+    (
+        "not logged in",
+        AuthError,
+        "Re-authenticate: refresh BW_SESSION or set BW_EMAIL/BW_PASSWORD so the bridge can login.",
+    ),
+    (
+        "vault is locked",
+        AuthError,
+        "Unlock the vault: provide BW_PASSWORD (or a valid unlocked BW_SESSION).",
+    ),
+    (
+        "session key is invalid",
+        AuthError,
+        "Refresh BW_SESSION or re-login with BW_EMAIL/BW_PASSWORD.",
+    ),
+    (
+        "session has expired",
+        AuthError,
+        "Refresh BW_SESSION or re-login with BW_EMAIL/BW_PASSWORD.",
+    ),
+    (
+        "invalid master password",
+        AuthError,
+        "Check BW_PASSWORD; unlock/login credentials are wrong.",
+    ),
+    (
+        "username or password is incorrect",
+        AuthError,
+        "Check BW_EMAIL and BW_PASSWORD.",
+    ),
+    (
+        "authentication failed",
+        AuthError,
+        "Re-authenticate against Vaultwarden (BW_SESSION or BW_EMAIL/BW_PASSWORD).",
+    ),
+    (
+        "unauthorized",
+        AuthError,
+        "Re-authenticate against Vaultwarden (BW_SESSION or BW_EMAIL/BW_PASSWORD).",
+    ),
+    (
+        "already logged in",
+        AuthError,
+        "Account is already logged in; bridge will unlock with BW_PASSWORD if configured.",
+    ),
+    (
+        "econnrefused",
+        AuthError,
+        "Verify VAULTWARDEN_SERVER/BW_SERVER is reachable from the bridge pod.",
+    ),
+    (
+        "enotfound",
+        AuthError,
+        "Verify VAULTWARDEN_SERVER/BW_SERVER hostname resolves and is correct.",
+    ),
+    (
+        "getaddrinfo",
+        AuthError,
+        "Verify VAULTWARDEN_SERVER/BW_SERVER hostname resolves and is correct.",
+    ),
+    (
+        "certificate",
+        AuthError,
+        "Check TLS trust for VAULTWARDEN_SERVER/BW_SERVER (custom CA or NODE_EXTRA_CA_CERTS).",
+    ),
+    (
+        "self signed",
+        AuthError,
+        "Check TLS trust for VAULTWARDEN_SERVER/BW_SERVER (custom CA or NODE_EXTRA_CA_CERTS).",
+    ),
+)
+
+
+def classify_bw_cli_failure(detail: str) -> BridgeError:
+    """Map bw CLI stderr/stdout detail to a distinct bridge error class."""
+    text = (detail or "").strip() or "unknown bw CLI failure"
+    lowered = text.lower()
+    for needle, exc_type, hint in _BW_ERROR_RULES:
+        if needle in lowered:
+            return exc_type(f"bw CLI failed: {text}", hint=hint)
+    return BwCliError(
+        f"bw CLI failed: {text}",
+        hint="Inspect bridge logs and bw CLI output; confirm server URL, auth, and network.",
+    )
 
 
 def load_mock_secrets(raw: str) -> Dict[str, Dict[str, str]]:
@@ -181,23 +305,28 @@ class BwCliBackend(SecretBackend):
                     timeout=self.command_timeout_seconds,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise SecretLookupError(
-                f"bw CLI timed out after {self.command_timeout_seconds}s"
+            raise BwCliError(
+                f"bw CLI timed out after {self.command_timeout_seconds}s",
+                hint="Increase BW_COMMAND_TIMEOUT_SECONDS or check Vaultwarden connectivity.",
             ) from exc
         if proc.returncode != 0 and not tolerate_failure:
             detail = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
-            raise SecretLookupError(f"bw CLI failed: {detail}")
+            raise classify_bw_cli_failure(detail)
         return proc.stdout.strip()
 
     def _run_bw_json(self, args: List[str]) -> Dict:
         for attempt in range(2):
             try:
                 stdout = self._run_bw_raw(args)
-            except SecretLookupError as exc:
+            except AuthError as exc:
                 # bw CLI can lose auth state at runtime; re-bootstrap and retry once.
-                if attempt == 0 and "You are not logged in." in str(exc):
+                if attempt == 0 and "not logged in" in str(exc).lower():
+                    LOGGER.warning("bw auth lost; re-bootstrapping (%s)", exc.log_message())
                     self._bootstrap_auth()
                     continue
+                LOGGER.error("bw auth failure (%s)", exc.log_message())
+                raise
+            except BridgeError:
                 raise
 
             try:
@@ -205,11 +334,23 @@ class BwCliBackend(SecretBackend):
             except json.JSONDecodeError as exc:
                 # Some bw-cli auth failures can surface as non-JSON stdout.
                 if attempt == 0:
+                    LOGGER.warning(
+                        "bw returned non-JSON stdout; re-bootstrapping auth before retry"
+                    )
                     self._bootstrap_auth()
                     continue
-                raise SecretLookupError(f"bw CLI returned invalid JSON: {exc}") from exc
+                raise InvalidJsonError(
+                    f"bw CLI returned invalid JSON: {exc}",
+                    hint=(
+                        "bw stdout was not JSON after re-auth. Confirm BW_SESSION unlock state, "
+                        "BW_EMAIL/BW_PASSWORD, and VAULTWARDEN_SERVER/BW_SERVER."
+                    ),
+                ) from exc
 
-        raise SecretLookupError("bw CLI JSON lookup exhausted retries")
+        raise InvalidJsonError(
+            "bw CLI JSON lookup exhausted retries",
+            hint="Re-auth (BW_SESSION or BW_EMAIL/BW_PASSWORD) and verify the server URL.",
+        )
 
     def _validate_session(self, session: str) -> bool:
         """Check whether a bw session can execute JSON-list commands."""
@@ -221,7 +362,7 @@ class BwCliBackend(SecretBackend):
                 include_session=False,
             )
             parsed = json.loads(stdout)
-        except (SecretLookupError, json.JSONDecodeError):
+        except (BridgeError, json.JSONDecodeError):
             return False
         return isinstance(parsed, list)
 
@@ -240,12 +381,19 @@ class BwCliBackend(SecretBackend):
             try:
                 self._run_bw_raw(["sync"])
                 return
-            except SecretLookupError:
+            except BridgeError as exc:
                 # Fall back to email/password auth when a preseeded session cannot sync.
+                LOGGER.warning(
+                    "preseeded BW_SESSION could not sync; falling back to login/unlock (%s)",
+                    exc.log_message(),
+                )
                 self.session = ""
         self.session = ""
         if not self.bw_email or not self.bw_password:
-            raise RuntimeError("bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD")
+            raise AuthError(
+                "bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD",
+                hint="Set a valid BW_SESSION, or both BW_EMAIL and BW_PASSWORD for login/unlock.",
+            )
 
         password_env = {"BW_BRIDGE_PASSWORD": self.bw_password}
         try:
@@ -254,17 +402,25 @@ class BwCliBackend(SecretBackend):
                 include_session=False,
                 extra_env=password_env,
             ).strip()
-        except SecretLookupError as exc:
+        except AuthError as exc:
             # bw may persist account metadata and require unlock instead of login.
             if "already logged in" not in str(exc).lower():
+                LOGGER.error("bw login failed (%s)", exc.log_message())
                 raise
+            LOGGER.info("bw already logged in; attempting unlock")
             session = self._run_bw_raw(
                 ["unlock", "--passwordenv", "BW_BRIDGE_PASSWORD", "--raw"],
                 include_session=False,
                 extra_env=password_env,
             ).strip()
         if not session or not self._validate_session(session):
-            raise RuntimeError("bw-cli login/unlock did not produce a valid session")
+            raise AuthError(
+                "bw-cli login/unlock did not produce a valid session",
+                hint=(
+                    "Check BW_EMAIL/BW_PASSWORD, unlock the vault, and verify "
+                    "VAULTWARDEN_SERVER/BW_SERVER."
+                ),
+            )
         self.session = session
         self._run_bw_raw(["sync"])
 
@@ -466,9 +622,50 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, {"value": value})
         except ValueError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except AuthError as exc:
+            LOGGER.error(
+                "auth failure path=%s code=%s error=%s",
+                self.path,
+                exc.code,
+                exc.log_message(),
+            )
+            self._write_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": str(exc), "code": exc.code, "hint": exc.hint},
+            )
+        except InvalidJsonError as exc:
+            LOGGER.error(
+                "invalid bw JSON path=%s code=%s error=%s",
+                self.path,
+                exc.code,
+                exc.log_message(),
+            )
+            self._write_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": str(exc), "code": exc.code, "hint": exc.hint},
+            )
         except SecretLookupError as exc:
-            LOGGER.warning("secret lookup failed path=%s error=%s", self.path, exc)
-            self._write_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            LOGGER.warning(
+                "secret lookup failed path=%s code=%s error=%s",
+                self.path,
+                exc.code,
+                exc.log_message(),
+            )
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": str(exc), "code": exc.code, "hint": exc.hint},
+            )
+        except BwCliError as exc:
+            LOGGER.error(
+                "bw CLI failure path=%s code=%s error=%s",
+                self.path,
+                exc.code,
+                exc.log_message(),
+            )
+            self._write_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": str(exc), "code": exc.code, "hint": exc.hint},
+            )
         except Exception as exc:  # pragma: no cover
             LOGGER.exception("bridge request failed path=%s", self.path)
             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})

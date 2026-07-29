@@ -1,0 +1,41 @@
+# Helm values for a local / CI mock-backend install.
+# Pairs with examples/01-bridge-auth-secret.yaml and 03/04 manifests.
+#
+#   helm upgrade --install vaultwarden-eso-bridge ./chart/vaultwarden-eso-bridge \
+#     -n secrets-platform --create-namespace \
+#     -f examples/values-mock.yaml
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+
+auth:
+  existingSecret: eso-bridge-auth
+  tokenKey: token
+
+backend:
+  mode: mock
+  itemNameTemplate: "{namespace}/{secret}"
+  # Paths must match ExternalSecret remoteRef.key values.
+  mockSecrets:
+    default/demo-app:
+      password: "<example-only-mock-demo-password>"
+      username: "<example-only-mock-demo-user>"
+    media/plex:
+      username: "<example-only-mock-plex-user>"
+      password: "<example-only-mock-plex-password>"
+      token: "<example-only-mock-plex-token>"
+
+networkPolicy:
+  enabled: true
+  allowSameNamespace: false
+  # Restrict ingress to ESO controller pods (adjust labels/namespaces).
+  allowedPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: external-secrets
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: external-secrets

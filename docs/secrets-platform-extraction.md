@@ -8,15 +8,17 @@ with no coupling to any single cluster repository layout.
 ## Portable Components
 
 1. `chart/vaultwarden-eso-bridge/`
-2. `tests/`
-3. `scripts/test-eso-bridge-unit.sh`
-4. `scripts/publish-secrets-platform-bridge-chart.sh`
-5. `docs/secrets-platform-extraction.md`
-6. `CHECKLIST.md`
+2. `examples/` (reference ESO manifests and Helm values; not cluster-specific)
+3. `tests/`
+4. `scripts/test-eso-bridge-unit.sh`
+5. `scripts/publish-secrets-platform-bridge-chart.sh`
+6. `docs/eso-integration.md`
+7. `docs/secrets-platform-extraction.md`
+8. `CHECKLIST.md`
 
 ## Local Integration Components (Keep Outside This Bundle)
 
-1. Cluster-specific `ClusterSecretStore` and `ExternalSecret` manifests
+1. Environment-specific overlays of `examples/` `ClusterSecretStore` / `ExternalSecret` manifests
 2. Environment-specific overlay/kustomization files
 3. Secret bootstrap manifests and sealed/encrypted secrets
 4. Platform routing and certificate policy manifests

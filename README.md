@@ -40,11 +40,21 @@ Primary override points:
 - `networkPolicy.*` for ingress restrictions
 - `resources` for CPU/memory constraints
 
+## Quick start (ESO examples)
+
+Copy-paste `ClusterSecretStore` / `ExternalSecret` manifests and Helm values:
+
+- [`examples/`](./examples/) — webhook store, ExternalSecrets, mock and `bw-cli` values
+- [`docs/eso-integration.md`](./docs/eso-integration.md) — mock and Vaultwarden
+  walkthroughs, NetworkPolicy guidance, and `BRIDGE_TOKEN` rotation
+
 ## Repository Contents
 
 - `chart/vaultwarden-eso-bridge`: reusable Helm chart
+- `examples`: end-to-end ESO webhook and ExternalSecret samples
 - `tests`: bridge unit/contract tests
 - `scripts/test-eso-bridge-unit.sh`: unit test entrypoint
 - `scripts/publish-secrets-platform-bridge-chart.sh`: OCI publish helper
+- `docs/eso-integration.md`: ESO integration walkthrough
 - `docs/secrets-platform-extraction.md`: standalone extraction guidance
 - `CHECKLIST.md`: first external-repo bootstrap and release checklist

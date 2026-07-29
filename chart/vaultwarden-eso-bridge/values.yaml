@@ -45,6 +45,20 @@ backend:
       failureThreshold: 60
   mockSecrets: {}
 
+# Probe defaults. Liveness uses /healthz (process up). Readiness uses /readyz
+# which fails for bw-cli when the Bitwarden session is invalid so the pod is
+# removed from Service endpoints and ESO stops hammering a dead bridge.
+# Leave initialDelaySeconds empty to keep mode-aware defaults (longer for bw-cli).
+probes:
+  readiness:
+    initialDelaySeconds: null
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: null
+    periodSeconds: 20
+    failureThreshold: 3
+
 resources: {}
 
 networkPolicy:

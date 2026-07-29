@@ -81,23 +81,28 @@ spec:
           {{- if and .Values.backend.bwCli.enabled .Values.backend.bwCli.startupProbe.enabled }}
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             periodSeconds: {{ .Values.backend.bwCli.startupProbe.periodSeconds }}
             failureThreshold: {{ .Values.backend.bwCli.startupProbe.failureThreshold }}
           {{- end }}
+          # Liveness stays on /healthz so a dead bw session does not restart-loop.
+          # Readiness uses /readyz and fails when the bw-cli session is invalid,
+          # removing the pod from Service endpoints so ESO stops calling it.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
-            initialDelaySeconds: {{ ternary 45 5 .Values.backend.bwCli.enabled }}
-            periodSeconds: 10
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default (ternary 45 5 .Values.backend.bwCli.enabled) }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: {{ ternary 90 10 .Values.backend.bwCli.enabled }}
-            periodSeconds: 20
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default (ternary 90 10 .Values.backend.bwCli.enabled) }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           volumeMounts:
             - name: bridge-script
               mountPath: /app

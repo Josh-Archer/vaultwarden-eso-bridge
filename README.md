@@ -50,15 +50,67 @@ Primary override points:
 - `service.*` for port/type/annotations
 - `exposure.allowExternalService` for explicit external exposure opt-in
 - `networkPolicy.*` for ingress restrictions
+- `probes.*` for liveness/readiness timing
 - `resources` for CPU/memory constraints
 
-## Quick start (ESO examples)
+## Health probes and metrics
 
-Copy-paste `ClusterSecretStore` / `ExternalSecret` manifests and Helm values:
+The bridge exposes three unauthenticated operational endpoints:
 
-- [`examples/`](./examples/) — webhook store, ExternalSecrets, mock and `bw-cli` values
-- [`docs/eso-integration.md`](./docs/eso-integration.md) — mock and Vaultwarden
-  walkthroughs, NetworkPolicy guidance, and `BRIDGE_TOKEN` rotation
+| Path | Purpose |
+|------|---------|
+| `/healthz` | Liveness. Always returns 200 while the HTTP server is up. |
+| `/readyz` | Readiness. Returns 200 when the backend can serve lookups; **503** when the bw-cli session is invalid. |
+| `/metrics` | Prometheus text metrics, including session-refresh counters. |
+
+### Why readiness is separate from liveness
+
+In `backend.mode=bw-cli`, the Bitwarden CLI session can die at runtime (logout,
+expired unlock, vault lock). When that happens the bridge records a failed
+auth refresh and marks itself not ready:
+
+- **Readiness** (`/readyz`) fails so Kubernetes removes the pod from Service
+  endpoints. External Secrets Operator (ESO) then stops hammering a bridge that
+  cannot authenticate.
+- **Liveness** (`/healthz`) stays healthy so the pod is not restart-looped
+  while credentials or Vaultwarden recover.
+
+Mock mode always reports ready.
+
+### Chart probe configuration
+
+```yaml
+probes:
+  readiness:
+    # null keeps mode-aware defaults (45s for bw-cli, 5s for mock)
+    initialDelaySeconds: null
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    # null keeps mode-aware defaults (90s for bw-cli, 10s for mock)
+    initialDelaySeconds: null
+    periodSeconds: 20
+    failureThreshold: 3
+
+backend:
+  bwCli:
+    # Startup uses /readyz so the pod is not marked Ready until login succeeds.
+    startupProbe:
+      enabled: true
+      periodSeconds: 10
+      failureThreshold: 60
+```
+
+### Session refresh metrics
+
+`GET /metrics` exposes (Prometheus exposition format):
+
+- `bridge_auth_refresh_success_total` — successful runtime session refresh/login/unlock
+- `bridge_auth_refresh_failure_total` — failed runtime session refresh attempts
+- `bridge_bw_session_ready` — gauge `1`/`0` for current readiness (bw-cli only)
+
+Initial startup auth does not increment the refresh counters; only runtime
+re-auth after a lost session does.
 
 ## Repository Contents
 

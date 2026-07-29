@@ -180,6 +180,8 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(backend.get_value("media", "servarr", "api-key"), "xyz")
         with self.assertRaises(bridge.SecretLookupError):
             backend.get_value("media", "servarr", "missing")
+        self.assertTrue(backend.is_ready())
+        self.assertIn("bridge_auth_refresh_success_total 0", backend.metrics_text())
 
     def test_bw_cli_backend_requires_auth_material(self):
         with patch.dict(
@@ -305,6 +307,9 @@ class BridgeUnitTests(unittest.TestCase):
                     command_timeout_seconds=20,
                 )
 
+        self.assertTrue(backend.is_ready())
+        self.assertEqual(backend.metrics.snapshot()["auth_refresh_success_total"], 0)
+
         with patch.object(backend, "_bootstrap_auth") as bootstrap_mock:
             with patch.object(
                 backend,
@@ -319,6 +324,111 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(items, [])
         bootstrap_mock.assert_called_once()
         self.assertEqual(run_mock.call_count, 2)
+        self.assertTrue(backend.is_ready())
+        self.assertEqual(backend.metrics.snapshot()["auth_refresh_success_total"], 1)
+        self.assertEqual(backend.metrics.snapshot()["auth_refresh_failure_total"], 0)
+
+    def test_bw_cli_backend_marks_not_ready_when_refresh_fails(self):
+        with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
+            with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
+                backend = bridge.BwCliBackend(
+                    bw_path="bw",
+                    folder_name="",
+                    org_id="",
+                    item_template="{namespace}/{secret}",
+                    bw_server="",
+                    bw_email="user@example.com",
+                    bw_password="password",
+                    bw_session="preseeded-session",
+                    cache_ttl_seconds=120,
+                    command_timeout_seconds=20,
+                )
+
+        with patch.object(
+            backend,
+            "_bootstrap_auth",
+            side_effect=RuntimeError("login failed"),
+        ):
+            with patch.object(
+                backend,
+                "_run_bw_raw",
+                side_effect=bridge.SecretLookupError(
+                    "bw CLI failed: You are not logged in."
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    backend._run_bw_json(["list", "items", "--search", "demo"])
+
+        self.assertFalse(backend.is_ready())
+        self.assertEqual(backend.metrics.snapshot()["auth_refresh_failure_total"], 1)
+        self.assertEqual(backend.metrics.snapshot()["auth_refresh_success_total"], 0)
+        metrics = backend.metrics_text()
+        self.assertIn("bridge_auth_refresh_failure_total 1", metrics)
+        self.assertIn("bridge_bw_session_ready 0", metrics)
+
+    def test_readyz_and_healthz_handlers(self):
+        backend = bridge.MockBackend({})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "token"
+        handler.backend = backend
+
+        class _FakeHandler(bridge.BridgeRequestHandler):
+            def __init__(self):
+                self.path = "/healthz"
+                self.headers = {}
+                self.responses = []
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                self.responses[-1]["body"] = b""
+
+            def _write_json(self, status, payload):
+                import json as _json
+
+                body = _json.dumps(payload).encode("utf-8")
+                self.responses.append(
+                    {"status": status, "body": body, "headers": {"Content-Type": "application/json"}}
+                )
+
+            def _write_text(self, status, body, content_type):
+                self.responses.append(
+                    {
+                        "status": status,
+                        "body": body.encode("utf-8"),
+                        "headers": {"Content-Type": content_type},
+                    }
+                )
+
+        fake = _FakeHandler()
+        fake.path = "/healthz"
+        fake.do_GET()
+        self.assertEqual(fake.responses[-1]["status"], 200)
+
+        fake.path = "/readyz"
+        fake.do_GET()
+        self.assertEqual(fake.responses[-1]["status"], 200)
+
+        class _NotReady:
+            def is_ready(self):
+                return False
+
+            def metrics_text(self):
+                return "bridge_bw_session_ready 0\n"
+
+        fake.backend = _NotReady()
+        fake.path = "/readyz"
+        fake.do_GET()
+        self.assertEqual(fake.responses[-1]["status"], 503)
+
+        fake.path = "/metrics"
+        fake.do_GET()
+        self.assertEqual(fake.responses[-1]["status"], 200)
+        self.assertIn(b"bridge_bw_session_ready", fake.responses[-1]["body"])
 
     def test_bw_cli_backend_surfaces_auth_error_after_reauth_failure(self):
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):

@@ -52,6 +52,7 @@ Required keys:
 3. `backend.vaultwarden.organizationId` (required key, may be empty)
 4. `backend.vaultwarden.folderName` (required key, may be empty)
 5. `backend.bwCli.sessionKey` (required key, may be empty; default `""`)
+6. `backend.bwCli.itemCacheTtlSeconds` (optional; default `0` = cache off; short TTL reduces bw CLI load under ESO storms but may serve stale secret values)
 
 ## Compatibility Matrix
 

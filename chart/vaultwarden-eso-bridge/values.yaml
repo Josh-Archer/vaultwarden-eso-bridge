@@ -37,7 +37,10 @@ backend:
     emailKey: BW_EMAIL
     passwordKey: BW_PASSWORD
     sessionKey: ""
-    itemCacheTtlSeconds: 120
+    # Optional in-process cache for hot secret item lookups (seconds).
+    # 0 = disabled (default). Short TTLs (e.g. 15–60) reduce bw CLI load under
+    # ESO reconcile storms but can serve stale secret values until expiry.
+    itemCacheTtlSeconds: 0
     commandTimeoutSeconds: 120
     startupProbe:
       enabled: true

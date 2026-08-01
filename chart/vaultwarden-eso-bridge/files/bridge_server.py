@@ -190,6 +190,18 @@ def extract_value_from_bw_item(item: Dict, key: str) -> Optional[str]:
     return None
 
 
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment value with fallback."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def parse_positive_int_env(name: str, default: int) -> int:
     """Parse a positive integer environment value with fallback."""
     raw = os.getenv(name, "").strip()

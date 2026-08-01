@@ -202,19 +202,19 @@ def parse_positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def parse_bool_env(name: str, default: bool) -> bool:
-    """Parse a boolean environment value with fallback."""
-    raw = os.getenv(name)
-    if raw is None:
+def parse_non_negative_int_env(name: str, default: int) -> int:
+    """Parse a non-negative integer environment value with fallback.
+
+    Zero is valid and typically means "feature disabled".
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
         return default
-    value = raw.strip().lower()
-    if not value:
+    try:
+        value = int(raw)
+    except ValueError:
         return default
-    if value in ("1", "true", "yes", "on"):
-        return True
-    if value in ("0", "false", "no", "off"):
-        return False
-    return default
+    return value if value >= 0 else default
 
 
 @dataclass
@@ -345,15 +345,16 @@ class BwCliBackend(SecretBackend):
         self.bw_email = bw_email
         self.bw_password = bw_password
         self.session = bw_session
-        self.cache_ttl_seconds = max(cache_ttl_seconds, 1)
+        # 0 disables the optional in-process item/key cache (safe default).
+        self.cache_ttl_seconds = max(int(cache_ttl_seconds), 0)
         self.command_timeout_seconds = max(command_timeout_seconds, 1)
         self.metrics = metrics or AuthMetrics()
         self._folder_id: Optional[str] = None
         self._cache_lock = threading.RLock()
         self._bw_lock = threading.Lock()
-        self._item_cache: Dict[str, Tuple[float, Dict]] = {}
-        self._session_ready = False
-        self._ready_lock = threading.Lock()
+        # Keys are always scoped by Kubernetes namespace + secret name so
+        # tenants never share cache entries even if itemNameTemplate collides.
+        self._item_cache: Dict[Tuple[str, str], Tuple[float, Dict]] = {}
 
         self._bootstrap_auth(record_metric=False)
         self._set_session_ready(True)
@@ -555,31 +556,45 @@ class BwCliBackend(SecretBackend):
             selected = items[0]
         return selected
 
-    def _get_item_cached(self, item_name: str) -> Dict:
+    def _lookup_item(self, item_name: str) -> Dict:
+        """Fetch a Vaultwarden item by name, syncing once on miss."""
+        for attempt in range(2):
+            items = self._run_bw_json(["list", "items", "--search", item_name])
+            try:
+                return self._select_item(items, item_name)
+            except SecretLookupError:
+                if attempt == 0:
+                    # Newly created Vaultwarden items can require an explicit sync.
+                    self._run_bw_raw(["sync"], tolerate_failure=True)
+                    continue
+                raise
+        raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
+
+    def _get_item_cached(self, namespace: str, secret: str, item_name: str) -> Dict:
+        """Return item, optionally serving from a short TTL cache.
+
+        Cache entries are keyed by (namespace, secret) so concurrent callers
+        for different tenants never share a slot. TTL of 0 disables caching.
+        """
+        if self.cache_ttl_seconds <= 0:
+            return self._lookup_item(item_name)
+
+        cache_key = (namespace, secret)
         now = time.time()
         with self._cache_lock:
-            cached = self._item_cache.get(item_name)
+            cached = self._item_cache.get(cache_key)
             if cached and cached[0] > now:
                 return cached[1]
 
-            for attempt in range(2):
-                items = self._run_bw_json(["list", "items", "--search", item_name])
-                try:
-                    selected = self._select_item(items, item_name)
-                    self._item_cache[item_name] = (now + self.cache_ttl_seconds, selected)
-                    return selected
-                except SecretLookupError:
-                    if attempt == 0:
-                        # Newly created Vaultwarden items can require an explicit sync.
-                        self._run_bw_raw(["sync"], tolerate_failure=True)
-                        continue
-                    raise
-
-            raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
+        # Fetch outside the lock so concurrent cache hits are not blocked on bw CLI.
+        selected = self._lookup_item(item_name)
+        with self._cache_lock:
+            self._item_cache[cache_key] = (time.time() + self.cache_ttl_seconds, selected)
+        return selected
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         item_name = self.item_template.format(namespace=namespace, secret=secret)
-        selected = self._get_item_cached(item_name)
+        selected = self._get_item_cached(namespace, secret, item_name)
 
         value = extract_value_from_bw_item(selected, key)
         if value is None:
@@ -704,7 +719,8 @@ def build_config_from_env() -> BridgeConfig:
         bw_password=os.getenv("BW_PASSWORD", "").strip(),
         bw_session=os.getenv("BW_SESSION", "").strip(),
         bw_path=os.getenv("BW_CLI_PATH", "bw").strip(),
-        bw_item_cache_ttl_seconds=parse_positive_int_env("BW_ITEM_CACHE_TTL_SECONDS", 120),
+        # Optional hot-key cache; 0 (default) keeps every reconcile live.
+        bw_item_cache_ttl_seconds=parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0),
         bw_command_timeout_seconds=parse_positive_int_env("BW_COMMAND_TIMEOUT_SECONDS", 120),
     )
 

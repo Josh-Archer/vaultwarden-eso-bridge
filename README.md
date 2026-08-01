@@ -52,6 +52,26 @@ Primary override points:
 - `networkPolicy.*` for ingress restrictions
 - `probes.*` for liveness/readiness timing
 - `resources` for CPU/memory constraints
+- `backend.bwCli.itemCacheTtlSeconds` for optional hot-key caching (see below)
+
+## Optional Hot-Key Cache (TTL)
+
+In `bw-cli` mode the bridge can keep a short in-process cache of resolved
+Vaultwarden items to cut repeated `bw` CLI latency when ESO reconciles the same
+secrets in a burst.
+
+| Setting | Env | Default | Notes |
+| --- | --- | --- | --- |
+| `backend.bwCli.itemCacheTtlSeconds` | `BW_ITEM_CACHE_TTL_SECONDS` | `0` (off) | Seconds to retain an item after a successful lookup |
+
+**Staleness tradeoffs:** while an entry is cached, callers receive the last
+resolved item fields even if the secret was rotated in Vaultwarden. Prefer
+`0` (live lookups) unless you are mitigating ESO storms; if you enable it, keep
+TTL short (for example `15`–`60` seconds) and accept delayed visibility of
+rotations until the entry expires.
+
+**Tenant safety:** cache entries are keyed by Kubernetes `namespace` + `secret`
+name, so concurrent tenants never share a cache slot.
 
 ## Health probes and metrics
 

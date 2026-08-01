@@ -247,10 +247,10 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
         self.assertFalse(calls[0][1]["include_session"])
 
-    def test_bw_cli_backend_caches_item_lookups(self):
+    def _make_bw_backend(self, *, cache_ttl_seconds: int = 120) -> "bridge.BwCliBackend":
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
-                backend = bridge.BwCliBackend(
+                return bridge.BwCliBackend(
                     bw_path="bw",
                     folder_name="",
                     org_id="",
@@ -259,10 +259,25 @@ class BridgeUnitTests(unittest.TestCase):
                     bw_email="",
                     bw_password="",
                     bw_session="preseeded-session",
-                    cache_ttl_seconds=120,
+                    cache_ttl_seconds=cache_ttl_seconds,
                     command_timeout_seconds=20,
                 )
 
+    def test_parse_non_negative_int_env_allows_zero(self):
+        with patch.dict(os.environ, {"BW_ITEM_CACHE_TTL_SECONDS": "0"}, clear=False):
+            self.assertEqual(bridge.parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 5), 0)
+        with patch.dict(os.environ, {"BW_ITEM_CACHE_TTL_SECONDS": "30"}, clear=False):
+            self.assertEqual(bridge.parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 5), 30)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(bridge.parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0), 0)
+
+    def test_build_config_defaults_cache_ttl_off(self):
+        with patch.dict(os.environ, {"BRIDGE_TOKEN": "t"}, clear=True):
+            config = bridge.build_config_from_env()
+        self.assertEqual(config.bw_item_cache_ttl_seconds, 0)
+
+    def test_bw_cli_backend_caches_item_lookups(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=120)
         calls = {"count": 0}
 
         def _fake_run_bw_json(args):
@@ -290,6 +305,74 @@ class BridgeUnitTests(unittest.TestCase):
             )
 
         self.assertEqual(calls["count"], 1)
+
+    def test_bw_cli_backend_cache_miss_for_different_secrets(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=120)
+        calls = []
+
+        def _fake_run_bw_json(args):
+            calls.append(args)
+            name = args[-1]
+            # Example-only fixture values (not real credentials).
+            return [{"name": name, "fields": [{"name": "api-key", "value": f"<example-only-{name}>"}]}]
+
+        with patch.object(backend, "_run_bw_json", side_effect=_fake_run_bw_json):
+            self.assertEqual(
+                backend.get_value("ns-a", "secret-a", "api-key"),
+                "<example-only-ns-a/secret-a>",
+            )
+            self.assertEqual(
+                backend.get_value("ns-b", "secret-a", "api-key"),
+                "<example-only-ns-b/secret-a>",
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn(("ns-a", "secret-a"), backend._item_cache)
+        self.assertIn(("ns-b", "secret-a"), backend._item_cache)
+
+    def test_bw_cli_backend_cache_disabled_when_ttl_zero(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        calls = {"count": 0}
+
+        def _fake_run_bw_json(args):
+            calls["count"] += 1
+            return [
+                {
+                    "name": "media/plex",
+                    "fields": [{"name": "token", "value": "t1"}],
+                }
+            ]
+
+        with patch.object(backend, "_run_bw_json", side_effect=_fake_run_bw_json):
+            self.assertEqual(backend.get_value("media", "plex", "token"), "t1")
+            self.assertEqual(backend.get_value("media", "plex", "token"), "t1")
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(backend._item_cache, {})
+
+    def test_bw_cli_backend_cache_expiry(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=10)
+        calls = {"count": 0}
+        clock = {"now": 1_000.0}
+
+        def _fake_run_bw_json(args):
+            calls["count"] += 1
+            return [
+                {
+                    "name": "media/plex",
+                    "fields": [{"name": "token", "value": f"v{calls['count']}"}],
+                }
+            ]
+
+        with patch.object(backend, "_run_bw_json", side_effect=_fake_run_bw_json):
+            with patch.object(bridge.time, "time", side_effect=lambda: clock["now"]):
+                self.assertEqual(backend.get_value("media", "plex", "token"), "v1")
+                clock["now"] = 1_005.0  # still within TTL
+                self.assertEqual(backend.get_value("media", "plex", "token"), "v1")
+                clock["now"] = 1_011.0  # expired
+                self.assertEqual(backend.get_value("media", "plex", "token"), "v2")
+
+        self.assertEqual(calls["count"], 2)
 
     def test_bw_cli_backend_reauths_when_session_is_lost(self):
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):

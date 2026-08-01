@@ -119,6 +119,62 @@ class BridgeUnitTests(unittest.TestCase):
             bridge.expand_token_variants("YWJjMTIz"),
         )
 
+    def test_token_matches_strict_accepts_exact_only(self):
+        configured = "abc123"
+        self.assertTrue(bridge.token_matches(configured, "abc123", legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, '"abc123"', legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, "'abc123'", legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, "YWJjMTIz", legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, "wrong", legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, None, legacy_variants=False))
+        self.assertFalse(bridge.token_matches(configured, "", legacy_variants=False))
+
+    def test_token_matches_legacy_accepts_quote_and_base64(self):
+        configured = "abc123"
+        self.assertTrue(bridge.token_matches(configured, "abc123", legacy_variants=True))
+        self.assertTrue(bridge.token_matches(configured, '"abc123"', legacy_variants=True))
+        self.assertTrue(bridge.token_matches(configured, "'abc123'", legacy_variants=True))
+        self.assertTrue(bridge.token_matches(configured, "YWJjMTIz", legacy_variants=True))
+        self.assertFalse(bridge.token_matches(configured, "wrong", legacy_variants=True))
+
+    def test_token_matches_legacy_warns_on_variant_not_exact(self):
+        configured = "abc123"
+        with self.assertLogs(bridge.LOGGER, level="WARNING") as captured:
+            matched = bridge.token_matches(configured, '"abc123"', legacy_variants=True)
+        self.assertTrue(matched)
+        self.assertTrue(
+            any("legacy variant expansion" in line for line in captured.output),
+            captured.output,
+        )
+
+        # Exact match must not warn.
+        with patch.object(bridge.LOGGER, "warning") as warn_mock:
+            self.assertTrue(
+                bridge.token_matches(configured, "abc123", legacy_variants=True)
+            )
+        warn_mock.assert_not_called()
+
+    def test_build_config_defaults_legacy_variants_off(self):
+        with patch.dict(
+            os.environ,
+            {"BRIDGE_TOKEN": "bridge-token"},
+            clear=True,
+        ):
+            config = bridge.build_config_from_env()
+        self.assertFalse(config.token_legacy_variants)
+
+    def test_build_config_reads_legacy_variants_flag(self):
+        with patch.dict(
+            os.environ,
+            {
+                "BRIDGE_TOKEN": "bridge-token",
+                "BRIDGE_TOKEN_LEGACY_VARIANTS": "true",
+            },
+            clear=True,
+        ):
+            config = bridge.build_config_from_env()
+        self.assertTrue(config.token_legacy_variants)
+
     def test_mock_backend_lookup(self):
         backend = bridge.MockBackend({"media/servarr": {"api-key": "xyz"}})
         self.assertEqual(backend.get_value("media", "servarr", "api-key"), "xyz")

@@ -28,9 +28,20 @@ with no coupling to any single cluster repository layout.
 Required behavior:
 
 1. Endpoint: `GET /v1/secret/{namespace}/{secret}/{key}`
-2. Auth: `Authorization: Bearer <token>`
+2. Auth: `Authorization: Bearer <token>` where `<token>` must **exactly** equal
+   `BRIDGE_TOKEN` by default (strict matching)
 3. Success response: JSON object containing string field `value`
 4. Key mapping: `{namespace}/{secret}` + `{key}` resolves one backend field
+
+### Token forms
+
+| Form | Strict default | Legacy expand (`BRIDGE_TOKEN_LEGACY_VARIANTS=true`) | Notes |
+| --- | --- | --- | --- |
+| Exact bearer string | Accepted | Accepted (no warning) | Preferred; store and send the raw shared secret |
+| Surrounding `"` or `'` quotes on the presented token | Rejected | Accepted with warning | Hides YAML/JSON quoting mistakes in secret material |
+| Single base64 encoding of the secret (UTF-8) as the presented token | Rejected | Accepted with warning | Hides accidental base64 of the shared secret |
+
+Legacy mode exists only for migration. When a non-exact variant matches, the bridge logs a warning so operators can correct secrets and disable expand mode.
 
 ## Helm Values Contract
 
@@ -50,6 +61,7 @@ Required keys:
 | `remoteRef.key` format `<namespace>/<secret-name>` | `backend.itemNameTemplate` (default `{namespace}/{secret}`) | `remoteRef.key`, `backend.itemNameTemplate` |
 | `remoteRef.property` | JSON response body field | `value` |
 | Auth secret for bridge | `BRIDGE_TOKEN` env | token key configured by `auth.tokenKey` |
+| Optional legacy token expand | `BRIDGE_TOKEN_LEGACY_VARIANTS` | `auth.legacyTokenVariants` (default `false`) |
 | Backend auth secret (`bw-cli`) | bw-cli bootstrap env | `BW_SERVER`, `BW_EMAIL`, `BW_PASSWORD` |
 
 ## OCI Pin/Upgrade Procedure
@@ -83,3 +95,6 @@ Rollback:
 2. Use `networkPolicy.enabled=true` plus explicit peers where supported.
 3. Treat `BRIDGE_TOKEN` as a shared bearer credential and rotate regularly.
 4. Prefer TLS for any hop that traverses untrusted network segments.
+5. Keep `auth.legacyTokenVariants` / `BRIDGE_TOKEN_LEGACY_VARIANTS` false unless
+   you are actively migrating mis-encoded tokens; variant matching can mask
+   configuration mistakes.

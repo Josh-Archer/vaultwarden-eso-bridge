@@ -28,6 +28,8 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.tokenKey }}
+            - name: BRIDGE_TOKEN_LEGACY_VARIANTS
+              value: "{{ .Values.auth.legacyTokenVariants }}"
             - name: BACKEND_MODE
               value: "{{ .Values.backend.mode }}"
             - name: ITEM_NAME_TEMPLATE

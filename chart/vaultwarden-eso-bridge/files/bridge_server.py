@@ -237,11 +237,70 @@ class BridgeConfig:
     bw_command_timeout_seconds: int
 
 
+class AuthMetrics:
+    """Thread-safe counters for bw-cli session refresh outcomes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.auth_refresh_success_total = 0
+        self.auth_refresh_failure_total = 0
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.auth_refresh_success_total += 1
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self.auth_refresh_failure_total += 1
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "auth_refresh_success_total": self.auth_refresh_success_total,
+                "auth_refresh_failure_total": self.auth_refresh_failure_total,
+            }
+
+    def render_prometheus(self, *, session_ready: Optional[bool] = None) -> str:
+        snap = self.snapshot()
+        lines = [
+            "# HELP bridge_auth_refresh_success_total Successful bw-cli session refresh attempts",
+            "# TYPE bridge_auth_refresh_success_total counter",
+            f"bridge_auth_refresh_success_total {snap['auth_refresh_success_total']}",
+            "# HELP bridge_auth_refresh_failure_total Failed bw-cli session refresh attempts",
+            "# TYPE bridge_auth_refresh_failure_total counter",
+            f"bridge_auth_refresh_failure_total {snap['auth_refresh_failure_total']}",
+        ]
+        if session_ready is not None:
+            lines.extend(
+                [
+                    "# HELP bridge_bw_session_ready Whether the bw-cli session is currently ready (1/0)",
+                    "# TYPE bridge_bw_session_ready gauge",
+                    f"bridge_bw_session_ready {1 if session_ready else 0}",
+                ]
+            )
+        return "\n".join(lines) + "\n"
+
+
 class SecretBackend:
     """Secret backend interface."""
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         raise NotImplementedError
+
+    def is_ready(self) -> bool:
+        """Return True when the backend can serve secret lookups."""
+        return True
+
+    def metrics_text(self) -> str:
+        """Prometheus text exposition for backend-specific metrics."""
+        return (
+            "# HELP bridge_auth_refresh_success_total Successful bw-cli session refresh attempts\n"
+            "# TYPE bridge_auth_refresh_success_total counter\n"
+            "bridge_auth_refresh_success_total 0\n"
+            "# HELP bridge_auth_refresh_failure_total Failed bw-cli session refresh attempts\n"
+            "# TYPE bridge_auth_refresh_failure_total counter\n"
+            "bridge_auth_refresh_failure_total 0\n"
+        )
 
 
 class MockBackend(SecretBackend):
@@ -276,6 +335,7 @@ class BwCliBackend(SecretBackend):
         bw_session: str,
         cache_ttl_seconds: int,
         command_timeout_seconds: int,
+        metrics: Optional[AuthMetrics] = None,
     ):
         self.bw_path = bw_path
         self.folder_name = folder_name
@@ -287,12 +347,27 @@ class BwCliBackend(SecretBackend):
         self.session = bw_session
         self.cache_ttl_seconds = max(cache_ttl_seconds, 1)
         self.command_timeout_seconds = max(command_timeout_seconds, 1)
+        self.metrics = metrics or AuthMetrics()
         self._folder_id: Optional[str] = None
         self._cache_lock = threading.RLock()
         self._bw_lock = threading.Lock()
         self._item_cache: Dict[str, Tuple[float, Dict]] = {}
+        self._session_ready = False
+        self._ready_lock = threading.Lock()
 
-        self._bootstrap_auth()
+        self._bootstrap_auth(record_metric=False)
+        self._set_session_ready(True)
+
+    def _set_session_ready(self, ready: bool) -> None:
+        with self._ready_lock:
+            self._session_ready = ready
+
+    def is_ready(self) -> bool:
+        with self._ready_lock:
+            return self._session_ready and bool(self.session)
+
+    def metrics_text(self) -> str:
+        return self.metrics.render_prometheus(session_ready=self.is_ready())
 
     def _run_bw_raw(
         self,
@@ -330,15 +405,27 @@ class BwCliBackend(SecretBackend):
             raise classify_bw_cli_failure(detail)
         return proc.stdout.strip()
 
+    def _refresh_session(self) -> None:
+        """Re-bootstrap auth and record success/failure metrics."""
+        try:
+            self._bootstrap_auth(record_metric=False)
+            self._set_session_ready(True)
+            self.metrics.record_success()
+            LOGGER.info("bw-cli session refresh succeeded")
+        except Exception as exc:
+            self._set_session_ready(False)
+            self.metrics.record_failure()
+            LOGGER.error("bw-cli session refresh failed: %s", exc)
+            raise
+
     def _run_bw_json(self, args: List[str]) -> Dict:
         for attempt in range(2):
             try:
                 stdout = self._run_bw_raw(args)
             except AuthError as exc:
                 # bw CLI can lose auth state at runtime; re-bootstrap and retry once.
-                if attempt == 0 and "not logged in" in str(exc).lower():
-                    LOGGER.warning("bw auth lost; re-bootstrapping (%s)", exc.log_message())
-                    self._bootstrap_auth()
+                if attempt == 0 and "You are not logged in." in str(exc):
+                    self._refresh_session()
                     continue
                 LOGGER.error("bw auth failure (%s)", exc.log_message())
                 raise
@@ -350,10 +437,7 @@ class BwCliBackend(SecretBackend):
             except json.JSONDecodeError as exc:
                 # Some bw-cli auth failures can surface as non-JSON stdout.
                 if attempt == 0:
-                    LOGGER.warning(
-                        "bw returned non-JSON stdout; re-bootstrapping auth before retry"
-                    )
-                    self._bootstrap_auth()
+                    self._refresh_session()
                     continue
                 raise InvalidJsonError(
                     f"bw CLI returned invalid JSON: {exc}",
@@ -391,54 +475,51 @@ class BwCliBackend(SecretBackend):
             include_session=False,
         )
 
-    def _bootstrap_auth(self) -> None:
-        self._configure_server()
-        if self.session and self._validate_session(self.session):
-            try:
-                self._run_bw_raw(["sync"])
-                return
-            except BridgeError as exc:
-                # Fall back to email/password auth when a preseeded session cannot sync.
-                LOGGER.warning(
-                    "preseeded BW_SESSION could not sync; falling back to login/unlock (%s)",
-                    exc.log_message(),
-                )
-                self.session = ""
-        self.session = ""
-        if not self.bw_email or not self.bw_password:
-            raise AuthError(
-                "bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD",
-                hint="Set a valid BW_SESSION, or both BW_EMAIL and BW_PASSWORD for login/unlock.",
-            )
-
-        password_env = {"BW_BRIDGE_PASSWORD": self.bw_password}
+    def _bootstrap_auth(self, *, record_metric: bool = False) -> None:
         try:
-            session = self._run_bw_raw(
-                ["login", self.bw_email, "--passwordenv", "BW_BRIDGE_PASSWORD", "--raw"],
-                include_session=False,
-                extra_env=password_env,
-            ).strip()
-        except AuthError as exc:
-            # bw may persist account metadata and require unlock instead of login.
-            if "already logged in" not in str(exc).lower():
-                LOGGER.error("bw login failed (%s)", exc.log_message())
-                raise
-            LOGGER.info("bw already logged in; attempting unlock")
-            session = self._run_bw_raw(
-                ["unlock", "--passwordenv", "BW_BRIDGE_PASSWORD", "--raw"],
-                include_session=False,
-                extra_env=password_env,
-            ).strip()
-        if not session or not self._validate_session(session):
-            raise AuthError(
-                "bw-cli login/unlock did not produce a valid session",
-                hint=(
-                    "Check BW_EMAIL/BW_PASSWORD, unlock the vault, and verify "
-                    "VAULTWARDEN_SERVER/BW_SERVER."
-                ),
-            )
-        self.session = session
-        self._run_bw_raw(["sync"])
+            self._configure_server()
+            if self.session and self._validate_session(self.session):
+                try:
+                    self._run_bw_raw(["sync"])
+                    if record_metric:
+                        self.metrics.record_success()
+                        self._set_session_ready(True)
+                    return
+                except SecretLookupError:
+                    # Fall back to email/password auth when a preseeded session cannot sync.
+                    self.session = ""
+            self.session = ""
+            if not self.bw_email or not self.bw_password:
+                raise RuntimeError("bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD")
+
+            password_env = {"BW_BRIDGE_PASSWORD": self.bw_password}
+            try:
+                session = self._run_bw_raw(
+                    ["login", self.bw_email, "--passwordenv", "BW_BRIDGE_PASSWORD", "--raw"],
+                    include_session=False,
+                    extra_env=password_env,
+                ).strip()
+            except SecretLookupError as exc:
+                # bw may persist account metadata and require unlock instead of login.
+                if "already logged in" not in str(exc).lower():
+                    raise
+                session = self._run_bw_raw(
+                    ["unlock", "--passwordenv", "BW_BRIDGE_PASSWORD", "--raw"],
+                    include_session=False,
+                    extra_env=password_env,
+                ).strip()
+            if not session or not self._validate_session(session):
+                raise RuntimeError("bw-cli login/unlock did not produce a valid session")
+            self.session = session
+            self._run_bw_raw(["sync"])
+            if record_metric:
+                self.metrics.record_success()
+                self._set_session_ready(True)
+        except Exception:
+            if record_metric:
+                self.metrics.record_failure()
+                self._set_session_ready(False)
+            raise
 
     def _resolve_folder_id(self) -> Optional[str]:
         if self._folder_id is not None:
@@ -667,6 +748,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_text(self, status: int, body: str, content_type: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
         presented = extract_bearer_token(header)
@@ -677,8 +766,31 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:  # noqa: N802
+        # Liveness: process is up. Keep this independent of session health so a
+        # dead bw session marks the pod NotReady without thrashing restarts.
         if self.path == "/healthz":
             self._write_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        # Readiness: for bw-cli, fail when the session is invalid so Service
+        # endpoints drop the pod and ESO stops hammering a dead bridge.
+        if self.path in ("/readyz", "/ready"):
+            ready = self.backend.is_ready()
+            if ready:
+                self._write_json(HTTPStatus.OK, {"ok": True, "ready": True})
+            else:
+                self._write_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "ready": False, "error": "backend session not ready"},
+                )
+            return
+
+        if self.path == "/metrics":
+            self._write_text(
+                HTTPStatus.OK,
+                self.backend.metrics_text(),
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
             return
 
         if not self._authorized():

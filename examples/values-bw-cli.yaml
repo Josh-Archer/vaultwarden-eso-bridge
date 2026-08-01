@@ -1,0 +1,55 @@
+# Helm values for Vaultwarden-backed bw-cli mode.
+# Requires examples/01-bridge-auth-secret.yaml and 02-bridge-bw-credentials.secret.yaml.
+#
+#   helm upgrade --install vaultwarden-eso-bridge ./chart/vaultwarden-eso-bridge \
+#     -n secrets-platform --create-namespace \
+#     -f examples/values-bw-cli.yaml
+#
+# Vaultwarden item naming (default template):
+#   item name = "{namespace}/{secret}"  e.g. default/demo-app
+# Store field values as custom fields, or use login.username / login.password.
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+
+auth:
+  existingSecret: eso-bridge-auth
+  tokenKey: token
+
+backend:
+  mode: bw-cli
+  itemNameTemplate: "{namespace}/{secret}"
+  vaultwarden:
+    # Prefer BW_SERVER in eso-bridge-bw; this is a non-secret fallback.
+    server: "https://vaultwarden.example.com"
+    organizationId: ""
+    folderName: "k8s-secrets"
+  bwCli:
+    enabled: true
+    cliVersion: "2025.12.0"
+    existingSecret: eso-bridge-bw
+    serverKey: BW_SERVER
+    emailKey: BW_EMAIL
+    passwordKey: BW_PASSWORD
+    # Set to "BW_SESSION" only if you pre-seed sessions in the secret.
+    sessionKey: ""
+    itemCacheTtlSeconds: 120
+    commandTimeoutSeconds: 120
+    startupProbe:
+      enabled: true
+      periodSeconds: 10
+      failureThreshold: 60
+
+networkPolicy:
+  enabled: true
+  allowSameNamespace: false
+  allowedPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: external-secrets
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: external-secrets

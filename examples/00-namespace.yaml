@@ -1,0 +1,8 @@
+# Optional isolation namespace for the bridge and its credentials.
+# Adjust names if you install the chart into an existing secrets platform NS.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secrets-platform
+  labels:
+    app.kubernetes.io/part-of: secrets-platform

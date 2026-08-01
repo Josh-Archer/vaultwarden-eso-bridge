@@ -132,12 +132,50 @@ backend:
 Initial startup auth does not increment the refresh counters; only runtime
 re-auth after a lost session does.
 
+## Tests
+
+### Unit tests (default CI)
+
+Mock-backed contract tests for path parsing, auth helpers, and bw-cli backend
+behavior. These are the default gate and do not require Docker or Vaultwarden:
+
+```bash
+./scripts/test-eso-bridge-unit.sh
+```
+
+### Integration tests (optional, real Vaultwarden)
+
+Optional docker-compose stack that stands up a real Vaultwarden with TLS, seeds
+an account/item, runs the bridge in `bw-cli` mode, and asserts:
+
+1. Missing/wrong bearer token → HTTP 401
+2. Valid bearer token + secret path → HTTP 200 with the seeded value
+
+```bash
+# Prerequisites: Docker Compose, Python 3 with cryptography (for local cert gen)
+./scripts/test-eso-bridge-integration.sh
+
+# Leave the stack up for debugging
+./scripts/test-eso-bridge-integration.sh --keep
+```
+
+Compose file: `tests/integration/docker-compose.yml`.
+
+In GitHub Actions, unit tests run on every push/PR. The integration job is
+opt-in via **Actions → tests → Run workflow → run_integration**.
+
+Kind is not required for the compose path above; the same bridge image and
+values can be exercised in a kind cluster if you already have a Vaultwarden
+endpoint, but compose is the supported automated path.
+
 ## Repository Contents
 
 - `chart/vaultwarden-eso-bridge`: reusable Helm chart
 - `examples`: end-to-end ESO webhook and ExternalSecret samples
 - `tests`: bridge unit/contract tests
+- `tests/integration`: optional Vaultwarden docker-compose integration harness
 - `scripts/test-eso-bridge-unit.sh`: unit test entrypoint
+- `scripts/test-eso-bridge-integration.sh`: optional real-Vaultwarden integration test
 - `scripts/publish-secrets-platform-bridge-chart.sh`: OCI publish helper
 - `docs/eso-integration.md`: ESO integration walkthrough
 - `docs/secrets-platform-extraction.md`: standalone extraction guidance

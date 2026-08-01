@@ -22,6 +22,12 @@ gh repo create <owner>/<repo> --source=. --remote=origin --push
 ./scripts/test-eso-bridge-unit.sh
 ```
 
+Optional (Docker required) real-Vaultwarden integration check:
+
+```bash
+./scripts/test-eso-bridge-integration.sh
+```
+
 ## 3. Set release metadata and registry target
 
 ```bash

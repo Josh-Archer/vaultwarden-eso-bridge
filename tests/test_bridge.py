@@ -435,9 +435,7 @@ class BridgeUnitTests(unittest.TestCase):
             with patch.object(
                 backend,
                 "_run_bw_raw",
-                side_effect=bridge.SecretLookupError(
-                    "bw CLI failed: You are not logged in."
-                ),
+                side_effect=bridge.classify_bw_cli_failure("You are not logged in."),
             ):
                 with self.assertRaises(RuntimeError):
                     backend._run_bw_json(["list", "items", "--search", "demo"])

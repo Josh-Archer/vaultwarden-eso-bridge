@@ -364,6 +364,8 @@ class BwCliBackend(SecretBackend):
         self._folder_id: Optional[str] = None
         self._cache_lock = threading.RLock()
         self._bw_lock = threading.Lock()
+        self._ready_lock = threading.Lock()
+        self._session_ready = False
         # Keys are always scoped by Kubernetes namespace + secret name so
         # tenants never share cache entries even if itemNameTemplate collides.
         self._item_cache: Dict[Tuple[str, str], Tuple[float, Dict]] = {}
@@ -503,7 +505,13 @@ class BwCliBackend(SecretBackend):
                     self.session = ""
             self.session = ""
             if not self.bw_email or not self.bw_password:
-                raise RuntimeError("bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD")
+                raise AuthError(
+                    "bw-cli backend requires BW_SESSION or BW_EMAIL/BW_PASSWORD",
+                    hint=(
+                        "Set BW_SESSION (unlocked) or both BW_EMAIL and BW_PASSWORD "
+                        "in the vaultwarden-bridge-bw secret."
+                    ),
+                )
 
             password_env = {"BW_BRIDGE_PASSWORD": self.bw_password}
             try:
@@ -512,7 +520,7 @@ class BwCliBackend(SecretBackend):
                     include_session=False,
                     extra_env=password_env,
                 ).strip()
-            except SecretLookupError as exc:
+            except BridgeError as exc:
                 # bw may persist account metadata and require unlock instead of login.
                 if "already logged in" not in str(exc).lower():
                     raise

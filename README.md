@@ -180,3 +180,7 @@ endpoint, but compose is the supported automated path.
 - `docs/eso-integration.md`: ESO integration walkthrough
 - `docs/secrets-platform-extraction.md`: standalone extraction guidance
 - `CHECKLIST.md`: first external-repo bootstrap and release checklist
+
+## Container image platforms
+
+Published bridge images are multi-arch (`linux/amd64` and `linux/arm64`) as of chart `0.1.8`.

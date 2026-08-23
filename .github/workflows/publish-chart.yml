@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "vaultwarden-eso-bridge-v*"
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -45,8 +46,10 @@ jobs:
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == vaultwarden-eso-bridge-v* ]]; then
             RESOLVED_VERSION="${GITHUB_REF_NAME#vaultwarden-eso-bridge-v}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            RESOLVED_VERSION="${GITHUB_REF_NAME#v}"
           elif [[ -n "${VERSION_INPUT}" ]]; then
-            RESOLVED_VERSION="${VERSION_INPUT}"
+            RESOLVED_VERSION="${VERSION_INPUT#v}"
           else
             RESOLVED_VERSION="${CHART_BASE_VERSION}-dev.${GITHUB_RUN_NUMBER}"
           fi

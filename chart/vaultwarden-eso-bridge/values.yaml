@@ -78,6 +78,16 @@ backend:
       enabled: true
       periodSeconds: 10
       failureThreshold: 60
+  # Bitwarden Secrets Manager (BWS) native machine account provider.
+  bws:
+    enabled: false
+    existingSecret: eso-bridge-bws
+    accessTokenKey: BWS_ACCESS_TOKEN
+    serverUrl: ""
+    projectId: ""
+    itemCacheTtlSeconds: 120
+    negativeCacheTtlSeconds: 15
+    commandTimeoutSeconds: 60
   mockSecrets: {}
 
 # Probe defaults. Liveness uses /healthz (process up). Readiness uses /readyz

@@ -85,6 +85,12 @@ class BwCliError(BridgeError):
     code = "bw_cli_error"
 
 
+class BwsError(BridgeError):
+    """Generic failure executing BWS command or API request."""
+
+    code = "bws_error"
+
+
 # (substring, error class, operator hint) — first match wins (case-insensitive).
 _BW_ERROR_RULES: Tuple[Tuple[str, type, str], ...] = (
     (
@@ -441,6 +447,13 @@ class BridgeConfig:
         bw_item_cache_ttl_seconds: int,
         bw_command_timeout_seconds: int,
         bw_negative_cache_ttl_seconds: int = 15,
+        bws_access_token: str = "",
+        bws_server_url: str = "",
+        bws_project_id: str = "",
+        bws_cli_path: str = "bws",
+        bws_item_cache_ttl_seconds: int = 120,
+        bws_negative_cache_ttl_seconds: int = 15,
+        bws_command_timeout_seconds: int = 60,
         tokenreview_enabled: bool = False,
         allowed_service_accounts: Optional[List[str]] = None,
         tokenreview_cache_ttl_seconds: int = 300,
@@ -465,6 +478,13 @@ class BridgeConfig:
         self.bw_item_cache_ttl_seconds = bw_item_cache_ttl_seconds
         self.bw_negative_cache_ttl_seconds = bw_negative_cache_ttl_seconds
         self.bw_command_timeout_seconds = bw_command_timeout_seconds
+        self.bws_access_token = bws_access_token
+        self.bws_server_url = bws_server_url
+        self.bws_project_id = bws_project_id
+        self.bws_cli_path = bws_cli_path
+        self.bws_item_cache_ttl_seconds = bws_item_cache_ttl_seconds
+        self.bws_negative_cache_ttl_seconds = bws_negative_cache_ttl_seconds
+        self.bws_command_timeout_seconds = bws_command_timeout_seconds
         self.tokenreview_enabled = tokenreview_enabled
         self.allowed_service_accounts = allowed_service_accounts or []
         self.tokenreview_cache_ttl_seconds = tokenreview_cache_ttl_seconds
@@ -1159,6 +1179,297 @@ class BwCliBackend(SecretBackend):
         return {"item": item_name, "rotated": rotated}
 
 
+
+class BwsBackend(SecretBackend):
+    """Bitwarden Secrets Manager (BWS) backend using machine access tokens."""
+
+    def __init__(
+        self,
+        access_token: str,
+        server_url: str = "",
+        project_id: str = "",
+        bws_path: str = "bws",
+        cache_ttl_seconds: int = 120,
+        negative_cache_ttl_seconds: int = 15,
+        command_timeout_seconds: int = 60,
+        metrics: Optional[AuthMetrics] = None,
+        http_client: Optional[Any] = None,
+    ):
+        self.access_token = access_token.strip()
+        self.server_url = (server_url.strip() or "https://vault.bitwarden.com/api").rstrip("/")
+        self.project_id = project_id.strip()
+        self.bws_path = bws_path.strip() or "bws"
+        self.cache_ttl_seconds = max(int(cache_ttl_seconds), 0)
+        self.negative_cache_ttl_seconds = max(int(negative_cache_ttl_seconds), 0)
+        self.command_timeout_seconds = max(command_timeout_seconds, 1)
+        self.metrics = metrics or AuthMetrics()
+        self._http_client = http_client
+        self._cache_lock = threading.RLock()
+        self._ready_lock = threading.Lock()
+        self._session_ready = bool(self.access_token)
+        # Cache entries: (expiry_timestamp, Optional[Dict[str, Any]], Optional[SecretLookupError])
+        self._item_cache: Dict[Tuple[str, str], Tuple[float, Optional[Dict[str, Any]], Optional[SecretLookupError]]] = {}
+
+        if not self.access_token:
+            LOGGER.warning("BWS_ACCESS_TOKEN is empty; BwsBackend will not be ready until a valid token is provided")
+
+    def is_ready(self) -> bool:
+        with self._ready_lock:
+            return bool(self.access_token) and self._session_ready
+
+    def metrics_text(self) -> str:
+        return self.metrics.render_prometheus(session_ready=self.is_ready())
+
+    def _api_request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Make an authenticated REST API request to Bitwarden Secrets Manager."""
+        if self._http_client is not None:
+            return self._http_client(method, endpoint, payload)
+
+        url = f"{self.server_url}/{endpoint.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "vaultwarden-eso-bridge/bws",
+        }
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.command_timeout_seconds) as resp:
+                resp_bytes = resp.read()
+                if not resp_bytes:
+                    return None
+                return json.loads(resp_bytes.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (401, 403):
+                with self._ready_lock:
+                    self._session_ready = False
+                raise AuthError(
+                    f"BWS authentication failed (HTTP {exc.code}): {body or exc.reason}",
+                    hint="Check BWS_ACCESS_TOKEN machine access token.",
+                ) from exc
+            if exc.code == 404:
+                raise SecretLookupError(
+                    f"BWS resource not found: {endpoint}",
+                    hint="Check secret name, project ID, and machine account permissions.",
+                ) from exc
+            raise BwsError(
+                f"BWS API error (HTTP {exc.code}): {body or exc.reason}",
+                hint="Check BWS API endpoint connectivity and payload.",
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise BwsError(
+                f"Failed to connect to BWS server ({self.server_url}): {exc.reason}",
+                hint="Check network connectivity, DNS, and BWS_SERVER_URL.",
+            ) from exc
+
+    def _get_secret_data(self, namespace: str, secret: str) -> Dict[str, Any]:
+        """Fetch and cache secret dictionary for namespace/secret."""
+        cache_key = (namespace, secret)
+        now = time.monotonic()
+
+        with self._cache_lock:
+            if self.cache_ttl_seconds > 0 or self.negative_cache_ttl_seconds > 0:
+                entry = self._item_cache.get(cache_key)
+                if entry:
+                    expires_at, cached_item, cached_exc = entry
+                    if now < expires_at:
+                        if cached_exc is not None:
+                            raise cached_exc
+                        if cached_item is not None:
+                            return cached_item
+
+        target_names = [
+            f"{namespace}/{secret}",
+            f"{namespace}_{secret}",
+            secret,
+        ]
+
+        try:
+            endpoint = f"secrets?projectId={self.project_id}" if self.project_id else "secrets"
+            resp = self._api_request("GET", endpoint)
+            items = resp.get("data", resp) if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+
+            matching_secret = None
+            for item in items:
+                key = item.get("key", "")
+                if key in target_names:
+                    matching_secret = item
+                    break
+
+            if not matching_secret:
+                exc = SecretLookupError(
+                    f"Secret '{namespace}/{secret}' not found in BWS (searched: {', '.join(target_names)})",
+                    hint=f"Create secret in BWS with key '{namespace}/{secret}' or check project assignment.",
+                )
+                if self.negative_cache_ttl_seconds > 0:
+                    with self._cache_lock:
+                        self._item_cache[cache_key] = (now + self.negative_cache_ttl_seconds, None, exc)
+                raise exc
+
+            secret_id = matching_secret.get("id")
+            if "value" not in matching_secret and secret_id:
+                secret_detail = self._api_request("GET", f"secrets/{secret_id}")
+            else:
+                secret_detail = matching_secret
+
+            value_str = secret_detail.get("value", "") or ""
+            note_str = secret_detail.get("note", "") or ""
+
+            data: Dict[str, Any] = {}
+            if value_str.strip().startswith("{") and value_str.strip().endswith("}"):
+                try:
+                    parsed = json.loads(value_str)
+                    if isinstance(parsed, dict):
+                        for k, v in parsed.items():
+                            data[k] = str(v) if v is not None else ""
+                except Exception:
+                    data = {}
+
+            if not data:
+                data = {
+                    "value": value_str,
+                    "password": value_str,
+                    "secret": value_str,
+                }
+                data[secret] = value_str
+
+            if note_str:
+                data["note"] = note_str
+
+            data["_id"] = secret_detail.get("id", "")
+            data["_key"] = secret_detail.get("key", "")
+            data["_projectId"] = secret_detail.get("projectId", "")
+
+            if self.cache_ttl_seconds > 0:
+                with self._cache_lock:
+                    self._item_cache[cache_key] = (now + self.cache_ttl_seconds, data, None)
+
+            return data
+
+        except (SecretLookupError, AuthError, BwsError):
+            raise
+        except Exception as exc:
+            raise BwsError(f"Unexpected error querying BWS for '{namespace}/{secret}': {exc}") from exc
+
+    def get_value(self, namespace: str, secret: str, key: str) -> str:
+        data = self._get_secret_data(namespace, secret)
+        if key not in data:
+            try:
+                sub_data = self._get_secret_data(namespace, f"{secret}/{key}")
+                if "value" in sub_data:
+                    return sub_data["value"]
+            except SecretLookupError:
+                pass
+            raise SecretLookupError(
+                f"Field '{key}' not found in secret '{namespace}/{secret}' (available: {', '.join([k for k in data.keys() if not k.startswith('_')])})",
+                hint="Add field to JSON payload in BWS or create individual secret item.",
+            )
+        return data[key]
+
+    def get_all_values(self, namespace: str, secret: str) -> Dict[str, str]:
+        data = self._get_secret_data(namespace, secret)
+        return {k: str(v) for k, v in data.items() if not k.startswith("_")}
+
+    def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
+        data = self._get_secret_data(namespace, secret)
+        if filename in data:
+            val = data[filename]
+            try:
+                decoded = base64.b64decode(val)
+                return decoded, "application/octet-stream"
+            except Exception:
+                return val.encode("utf-8"), "text/plain"
+        raise SecretLookupError(
+            f"Attachment '{filename}' not found on secret '{namespace}/{secret}'",
+            hint="Store attachment base64 encoded in secret field or note.",
+        )
+
+    def ensure_item(self, item_name: str, fields: Dict[str, str]) -> Dict[str, Any]:
+        parts = item_name.split("/", 1)
+        namespace = parts[0] if len(parts) > 1 else "default"
+        secret = parts[1] if len(parts) > 1 else parts[0]
+
+        try:
+            existing = self._get_secret_data(namespace, secret)
+            secret_id = existing.get("_id")
+            updated = False
+            current_dict = {k: v for k, v in existing.items() if not k.startswith("_")}
+            for k, v in fields.items():
+                if k not in current_dict or not current_dict[k]:
+                    current_dict[k] = v
+                    updated = True
+
+            if updated and secret_id:
+                new_value = json.dumps(current_dict)
+                self._api_request(
+                    "PUT",
+                    f"secrets/{secret_id}",
+                    {
+                        "projectId": existing.get("_projectId") or self.project_id or None,
+                        "key": existing.get("_key") or item_name,
+                        "value": new_value,
+                        "note": existing.get("note", ""),
+                    },
+                )
+                with self._cache_lock:
+                    self._item_cache.pop((namespace, secret), None)
+                return {"item": item_name, "status": "updated", "fields": list(fields.keys())}
+            return {"item": item_name, "status": "unchanged"}
+        except SecretLookupError:
+            new_value = json.dumps(fields)
+            resp = self._api_request(
+                "POST",
+                "secrets",
+                {
+                    "projectId": self.project_id or None,
+                    "key": item_name,
+                    "value": new_value,
+                    "note": f"Managed by vaultwarden-eso-bridge ({namespace})",
+                },
+            )
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            return {"item": item_name, "status": "created", "id": resp.get("id") if isinstance(resp, dict) else None}
+
+    def rotate_item(self, item_name: str, field_names: List[str], length: int = 32) -> Dict[str, Any]:
+        parts = item_name.split("/", 1)
+        namespace = parts[0] if len(parts) > 1 else "default"
+        secret = parts[1] if len(parts) > 1 else parts[0]
+
+        existing = self._get_secret_data(namespace, secret)
+        secret_id = existing.get("_id")
+        if not secret_id:
+            raise SecretLookupError(f"Cannot rotate item '{item_name}': missing secret ID")
+
+        current_dict = {k: v for k, v in existing.items() if not k.startswith("_")}
+        rotated = []
+        for field in field_names:
+            current_dict[field] = generate_password(length)
+            rotated.append(field)
+
+        new_value = json.dumps(current_dict)
+        self._api_request(
+            "PUT",
+            f"secrets/{secret_id}",
+            {
+                "projectId": existing.get("_projectId") or self.project_id or None,
+                "key": existing.get("_key") or item_name,
+                "value": new_value,
+                "note": existing.get("note", ""),
+            },
+        )
+        with self._cache_lock:
+            self._item_cache.pop((namespace, secret), None)
+        return {"item": item_name, "rotated": rotated}
+
 def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
     """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""
     parsed = urlparse(path)
@@ -1293,6 +1604,13 @@ def build_config_from_env() -> BridgeConfig:
         bw_item_cache_ttl_seconds=parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0),
         bw_command_timeout_seconds=parse_positive_int_env("BW_COMMAND_TIMEOUT_SECONDS", 120),
         bw_negative_cache_ttl_seconds=parse_non_negative_int_env("BW_NEGATIVE_CACHE_TTL_SECONDS", 15),
+        bws_access_token=os.getenv("BWS_ACCESS_TOKEN", "").strip(),
+        bws_server_url=os.getenv("BWS_SERVER_URL", "").strip(),
+        bws_project_id=os.getenv("BWS_PROJECT_ID", "").strip(),
+        bws_cli_path=os.getenv("BWS_CLI_PATH", "bws").strip(),
+        bws_item_cache_ttl_seconds=parse_non_negative_int_env("BWS_ITEM_CACHE_TTL_SECONDS", 120),
+        bws_negative_cache_ttl_seconds=parse_non_negative_int_env("BWS_NEGATIVE_CACHE_TTL_SECONDS", 15),
+        bws_command_timeout_seconds=parse_positive_int_env("BWS_COMMAND_TIMEOUT_SECONDS", 60),
         tokenreview_enabled=tokenreview_enabled,
         allowed_service_accounts=allowed_service_accounts,
         tokenreview_cache_ttl_seconds=parse_non_negative_int_env("TOKENREVIEW_CACHE_TTL_SECONDS", 300),
@@ -1320,6 +1638,16 @@ def build_backend(config: BridgeConfig) -> SecretBackend:
             cache_ttl_seconds=config.bw_item_cache_ttl_seconds,
             command_timeout_seconds=config.bw_command_timeout_seconds,
             negative_cache_ttl_seconds=config.bw_negative_cache_ttl_seconds,
+        )
+    if config.backend_mode == "bws":
+        return BwsBackend(
+            access_token=config.bws_access_token,
+            server_url=config.bws_server_url,
+            project_id=config.bws_project_id,
+            bws_path=config.bws_cli_path,
+            cache_ttl_seconds=config.bws_item_cache_ttl_seconds,
+            negative_cache_ttl_seconds=config.bws_negative_cache_ttl_seconds,
+            command_timeout_seconds=config.bws_command_timeout_seconds,
         )
     raise RuntimeError(f"Unsupported BACKEND_MODE: {config.backend_mode}")
 

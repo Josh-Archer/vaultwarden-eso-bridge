@@ -1,0 +1,53 @@
+# Example Helm values for deploying vaultwarden-eso-bridge with native
+# Bitwarden Secrets Manager (BWS) machine account authentication.
+
+replicaCount: 2
+
+service:
+  type: ClusterIP
+  port: 8080
+
+auth:
+  mode: tokenReview
+  tokenReview:
+    enabled: true
+    allowedServiceAccounts:
+      - "system:serviceaccount:external-secrets:external-secrets"
+    cacheTtlSeconds: 300
+
+serviceAccount:
+  create: true
+  name: vaultwarden-eso-bridge
+
+rbac:
+  create: true
+
+backend:
+  mode: bws
+  bws:
+    enabled: true
+    existingSecret: eso-bridge-bws
+    accessTokenKey: BWS_ACCESS_TOKEN
+    serverUrl: "https://vault.bitwarden.com/api" # or https://vault.bitwarden.eu/api / self-hosted
+    projectId: "" # Optional default project filter
+    itemCacheTtlSeconds: 120
+    negativeCacheTtlSeconds: 15
+    commandTimeoutSeconds: 60
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: monitoring-prometheus-stack
+  interval: 30s
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

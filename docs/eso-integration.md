@@ -229,6 +229,25 @@ Operational tips:
 
 ---
 
+## Zero-shared-secret ServiceAccount TokenReview mode
+
+To eliminate static shared `BRIDGE_TOKEN` secrets entirely:
+
+1. Configure Helm values with `auth.mode: "tokenReview"` (or `auth.tokenReview.enabled: true`):
+   ```yaml
+   auth:
+     mode: tokenReview
+     tokenReview:
+       enabled: true
+       allowedServiceAccounts:
+         - "system:serviceaccount:external-secrets:external-secrets"
+       cacheTtlSeconds: 300
+   ```
+2. Deploy `examples/08-clustersecretstore-tokenreview.yaml`, which sets `serviceAccountRef` on ESO's webhook provider. ESO automatically projects its short-lived ServiceAccount token to the bridge, and the bridge validates caller identity via the Kubernetes TokenReview API.
+3. In-pod TLS termination can be enabled with `tls.enabled: true` and `tls.existingSecret: <secret-name>` to encrypt traffic end-to-end between ESO and the bridge.
+
+---
+
 ## File map
 
 | Path | Purpose |

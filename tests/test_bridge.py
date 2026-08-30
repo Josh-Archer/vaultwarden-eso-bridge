@@ -1213,5 +1213,150 @@ class BridgeUnitTests(unittest.TestCase):
         # Two generated passwords should be different (with overwhelming probability)
         self.assertNotEqual(pw16, bridge.generate_password(16))
 
+
+    def test_tokenreview_matches_service_account(self):
+        """Test TokenReview SA rule matching against various patterns."""
+        auth = bridge.TokenReviewAuthenticator([
+            "system:serviceaccount:external-secrets:external-secrets",
+            "media:*",
+            "custom-ns:my-app",
+            "slash-ns/slash-app",
+        ])
+
+        # Exact match
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:external-secrets:external-secrets"))
+        # Namespace wildcard
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:media:plex"))
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:media:radarr"))
+        # Short forms
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:custom-ns:my-app"))
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:slash-ns:slash-app"))
+
+        # Non-matching
+        self.assertFalse(auth.matches_service_account("system:serviceaccount:default:attacker"))
+        self.assertFalse(auth.matches_service_account("system:serviceaccount:media2:plex"))
+        self.assertFalse(auth.matches_service_account(""))
+
+    def test_tokenreview_global_wildcard(self):
+        """Test TokenReview SA matching with global wildcard."""
+        auth = bridge.TokenReviewAuthenticator(["*"])
+        self.assertTrue(auth.matches_service_account("system:serviceaccount:any:sa"))
+        self.assertFalse(auth.matches_service_account(""))
+
+    def test_tokenreview_authenticator_cache_and_validation(self):
+        """Test TokenReviewAuthenticator caching, hits, and rejection."""
+        auth = bridge.TokenReviewAuthenticator(
+            ["system:serviceaccount:external-secrets:external-secrets"],
+            cache_ttl_seconds=60,
+            negative_cache_ttl_seconds=10,
+        )
+
+        reviews = []
+        def _mock_review(token):
+            reviews.append(token)
+            if token == "valid-sa-jwt":
+                return True, "system:serviceaccount:external-secrets:external-secrets"
+            if token == "unauthorized-sa-jwt":
+                return True, "system:serviceaccount:default:intruder"
+            return False, ""
+
+        with patch.object(auth, "_review_token", side_effect=_mock_review):
+            # 1. Valid token
+            self.assertTrue(auth.authenticate("valid-sa-jwt"))
+            self.assertEqual(len(reviews), 1)
+
+            # 2. Cache hit on valid token
+            self.assertTrue(auth.authenticate("valid-sa-jwt"))
+            self.assertEqual(len(reviews), 1)  # No new review call
+
+            # 3. Unauthorized user
+            self.assertFalse(auth.authenticate("unauthorized-sa-jwt"))
+            self.assertEqual(len(reviews), 2)
+
+            # 4. Negative cache hit
+            self.assertFalse(auth.authenticate("unauthorized-sa-jwt"))
+            self.assertEqual(len(reviews), 2)  # No new review call
+
+            # 5. Invalid / empty token
+            self.assertFalse(auth.authenticate(""))
+            self.assertFalse(auth.authenticate(None))
+
+    def test_handler_tokenreview_authentication(self):
+        """Test BridgeRequestHandler authenticating via TokenReview."""
+        backend = bridge.MockBackend(secrets={"media/plex": {"token": "plex-pass"}})
+        auth = bridge.TokenReviewAuthenticator(["system:serviceaccount:external-secrets:external-secrets"])
+
+        with patch.object(auth, "_review_token", return_value=(True, "system:serviceaccount:external-secrets:external-secrets")):
+            handler = bridge.BridgeRequestHandler
+            handler.token = ""  # No static token
+            handler.token_review_authenticator = auth
+            handler.backend = backend
+            handler.token_legacy_variants = False
+
+            class _TestHandler(bridge.BridgeRequestHandler):
+                def __init__(self, path, headers=None):
+                    self.path = path
+                    self.headers = headers or {}
+                    self.responses = []
+
+                def send_response(self, status):
+                    self.responses.append({"status": status, "headers": {}})
+
+                def send_header(self, key, value):
+                    self.responses[-1]["headers"][key] = value
+
+                def end_headers(self):
+                    self.responses[-1]["body"] = b""
+
+                def _write_json(self, status, payload):
+                    import json as _json
+                    self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
+
+            # Valid TokenReview SA bearer token
+            h_valid = _TestHandler("/v1/secret/media/plex/token", {"Authorization": "Bearer sa-jwt-123"})
+            h_valid.do_GET()
+            self.assertEqual(h_valid.responses[-1]["status"], 200)
+            self.assertEqual(h_valid.responses[-1]["payload"]["value"], "plex-pass")
+
+            # Missing authorization header
+            h_no_auth = _TestHandler("/v1/secret/media/plex/token", {})
+            h_no_auth.do_GET()
+            self.assertEqual(h_no_auth.responses[-1]["status"], 401)
+
+    def test_build_config_tokenreview_and_tls(self):
+        """Test build_config_from_env parsing TokenReview and TLS flags."""
+        env_vars = {
+            "BRIDGE_TOKEN": "static-token",
+            "TOKENREVIEW_ENABLED": "true",
+            "ALLOWED_SERVICE_ACCOUNTS": "system:serviceaccount:ns1:sa1, ns2:*",
+            "TOKENREVIEW_CACHE_TTL_SECONDS": "180",
+            "TOKENREVIEW_AUDIENCES": "https://vaultwarden-eso-bridge, api",
+            "TLS_ENABLED": "true",
+            "TLS_CERT_PATH": "/custom/tls.crt",
+            "TLS_KEY_PATH": "/custom/tls.key",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertEqual(config.token, "static-token")
+            self.assertTrue(config.tokenreview_enabled)
+            self.assertEqual(config.allowed_service_accounts, ["system:serviceaccount:ns1:sa1", "ns2:*"])
+            self.assertEqual(config.tokenreview_cache_ttl_seconds, 180)
+            self.assertEqual(config.tokenreview_audiences, ["https://vaultwarden-eso-bridge", "api"])
+            self.assertTrue(config.tls_enabled)
+            self.assertEqual(config.tls_cert_path, "/custom/tls.crt")
+            self.assertEqual(config.tls_key_path, "/custom/tls.key")
+
+    def test_build_config_pure_tokenreview_mode(self):
+        """Test build_config_from_env allows pure TokenReview mode with no BRIDGE_TOKEN."""
+        env_vars = {
+            "BRIDGE_TOKEN": "",
+            "AUTH_MODE": "tokenreview",
+            "ALLOWED_SERVICE_ACCOUNTS": "system:serviceaccount:external-secrets:external-secrets",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertEqual(config.token, "")
+            self.assertTrue(config.tokenreview_enabled)
+
 if __name__ == "__main__":
     unittest.main()

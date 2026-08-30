@@ -1,0 +1,29 @@
+{{- if and .Values.rbac.create (or .Values.auth.tokenReview.enabled (eq .Values.auth.mode "tokenReview") (eq .Values.auth.mode "dual")) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-tokenreview
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-tokenreview
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

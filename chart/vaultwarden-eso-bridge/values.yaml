@@ -16,12 +16,40 @@ exposure:
   allowExternalService: false
 
 auth:
+  # Authentication mode: "token" (static BRIDGE_TOKEN), "tokenReview" (Kubernetes SA tokens), or "dual" (both accepted).
+  mode: token
   existingSecret: eso-bridge-auth
   tokenKey: token
   # Strict exact BRIDGE_TOKEN match by default. Set true only while migrating
   # mis-encoded secrets that rely on quote-strip or base64 bearer variants.
   legacyTokenVariants: false
+  # Kubernetes ServiceAccount TokenReview authentication (zero shared secrets).
+  tokenReview:
+    enabled: false
+    # Allowed ServiceAccount identities (full name, namespace:name, or namespace:*).
+    allowedServiceAccounts:
+      - "system:serviceaccount:external-secrets:external-secrets"
+    # In-process cache TTL for validated SA tokens (seconds).
+    cacheTtlSeconds: 300
+    # Optional target audiences for TokenReview validation.
+    audiences: []
 
+# -- ServiceAccount configuration.
+serviceAccount:
+  create: true
+  name: vaultwarden-eso-bridge
+  annotations: {}
+
+# -- RBAC permissions for Kubernetes TokenReview API.
+rbac:
+  create: true
+
+# -- In-pod TLS / HTTPS termination.
+tls:
+  enabled: false
+  existingSecret: ""
+  certPath: /etc/tls/tls.crt
+  keyPath: /etc/tls/tls.key
 backend:
   mode: mock
   itemNameTemplate: "{namespace}/{secret}"

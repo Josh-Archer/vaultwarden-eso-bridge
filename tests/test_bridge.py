@@ -1362,7 +1362,7 @@ class BridgeUnitTests(unittest.TestCase):
 
     def test_bws_backend_init_and_readiness(self):
         """Test BwsBackend readiness with and without access token."""
-        backend_ready = bridge.BwsBackend(access_token="0.valid-token:secret")
+        backend_ready = bridge.BwsBackend(access_token="mock-bws-access-token-ready")
         self.assertTrue(backend_ready.is_ready())
         self.assertIn("bridge_bw_session_ready 1", backend_ready.metrics_text())
 
@@ -1497,7 +1497,7 @@ class BridgeUnitTests(unittest.TestCase):
         env_vars = {
             "BRIDGE_TOKEN": "test-token",
             "BACKEND_MODE": "bws",
-            "BWS_ACCESS_TOKEN": "0.test-token:secret",
+            "BWS_ACCESS_TOKEN": "mock-bws-test-token-123",
             "BWS_SERVER_URL": "https://vault.bitwarden.eu/api",
             "BWS_PROJECT_ID": "proj-uuid-123",
             "BWS_ITEM_CACHE_TTL_SECONDS": "90",
@@ -1507,7 +1507,7 @@ class BridgeUnitTests(unittest.TestCase):
         with patch.dict(os.environ, env_vars, clear=False):
             config = bridge.build_config_from_env()
             self.assertEqual(config.backend_mode, "bws")
-            self.assertEqual(config.bws_access_token, "0.test-token:secret")
+            self.assertEqual(config.bws_access_token, "mock-bws-test-token-123")
             self.assertEqual(config.bws_server_url, "https://vault.bitwarden.eu/api")
             self.assertEqual(config.bws_project_id, "proj-uuid-123")
             self.assertEqual(config.bws_item_cache_ttl_seconds, 90)

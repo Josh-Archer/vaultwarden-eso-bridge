@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.4.0...v0.5.0) (2026-08-30)
+
+
+### Features
+
+* **backend:** native Bitwarden Secrets Manager (BWS) machine account provider ([#28](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/28)) ([#38](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/38)) ([b1e03ad](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/b1e03adb83c27e96e2594bbacd9d99f6b85d718c))
+
 ## [0.4.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.3.0...v0.4.0) (2026-08-30)
 
 

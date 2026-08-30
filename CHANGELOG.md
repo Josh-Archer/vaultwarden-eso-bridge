@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.2.0...v0.3.0) (2026-08-30)
+
+
+### Features
+
+* **api:** add multi-key bulk JSON, negative caching, and file attachments ([#19](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/19), [#20](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/20), [#23](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/23)) ([#32](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/32)) ([43f19ea](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/43f19eac0d2e74a705ba5894b3f2ee61393051d8))
+* **api:** add POST /v1/admin/ensure and /v1/admin/rotate endpoints ([#21](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/21)) ([#35](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/35)) ([03b1021](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/03b10211688ee2cd8350ae91b7f49ab5c65b76f2))
+* **helm:** add ServiceMonitor, PrometheusRule, and PodDisruptionBudget templates ([#26](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/26)) ([#34](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/34)) ([0b0b857](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/0b0b857925a2e84a25cc187bca356a3d4932d1ac))
+
 ## [0.2.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.1.8...v0.2.0) (2026-08-23)
 
 

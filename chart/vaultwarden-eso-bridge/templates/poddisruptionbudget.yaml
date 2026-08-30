@@ -1,0 +1,18 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vaultwarden-eso-bridge
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-eso-bridge
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable | default 1 }}
+  {{- end }}
+{{- end }}

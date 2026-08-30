@@ -1,0 +1,44 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: vaultwarden-eso-bridge
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+    {{- with .Values.prometheusRule.labels }}
+{{ toYaml . | indent 4 }}
+    {{- end }}
+  {{- with .Values.prometheusRule.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: vaultwarden-eso-bridge
+      rules:
+        - alert: VaultwardenBridgeSessionDown
+          expr: bridge_bw_session_ready == 0
+          for: {{ .Values.prometheusRule.sessionDownFor | default "5m" }}
+          labels:
+            severity: {{ .Values.prometheusRule.sessionDownSeverity | default "critical" }}
+          annotations:
+            summary: "Vaultwarden ESO bridge bw-cli session is down"
+            description: "The bridge pod {{ "{{" }} $labels.pod {{ "}}" }} has had an invalid bw-cli session for more than {{ .Values.prometheusRule.sessionDownFor | default "5m" }}."
+        - alert: VaultwardenBridgeHighErrorRate
+          expr: |
+            (
+              sum(rate(bridge_request_duration_seconds_count{status=~"5.."}[5m]))
+            /
+              sum(rate(bridge_request_duration_seconds_count[5m]))
+            ) > {{ .Values.prometheusRule.highErrorRateThreshold | default 0.1 }}
+          for: {{ .Values.prometheusRule.highErrorRateFor | default "5m" }}
+          labels:
+            severity: {{ .Values.prometheusRule.highErrorRateSeverity | default "warning" }}
+          annotations:
+            summary: "Vaultwarden ESO bridge error rate is high"
+            description: "Bridge 5xx error rate exceeded {{ .Values.prometheusRule.highErrorRateThreshold | default 0.1 }} for more than {{ .Values.prometheusRule.highErrorRateFor | default "5m" }}."
+        {{- with .Values.prometheusRule.additionalRules }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+{{- end }}

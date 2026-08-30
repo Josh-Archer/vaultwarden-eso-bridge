@@ -15,6 +15,7 @@ spec:
       labels:
         app.kubernetes.io/name: vaultwarden-eso-bridge
     spec:
+      serviceAccountName: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}
       containers:
         - name: bridge
           image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
@@ -23,11 +24,35 @@ spec:
           env:
             - name: BRIDGE_PORT
               value: "{{ .Values.service.port }}"
+          {{- if or (ne .Values.auth.mode "tokenReview") .Values.auth.existingSecret }}
+          {{- if .Values.auth.existingSecret }}
             - name: BRIDGE_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.tokenKey }}
+          {{- end }}
+          {{- end }}
+          {{- if or .Values.auth.tokenReview.enabled (eq .Values.auth.mode "tokenReview") (eq .Values.auth.mode "dual") }}
+            - name: TOKENREVIEW_ENABLED
+              value: "true"
+            - name: ALLOWED_SERVICE_ACCOUNTS
+              value: {{ join "," .Values.auth.tokenReview.allowedServiceAccounts | quote }}
+            - name: TOKENREVIEW_CACHE_TTL_SECONDS
+              value: "{{ .Values.auth.tokenReview.cacheTtlSeconds | default 300 }}"
+          {{- if .Values.auth.tokenReview.audiences }}
+            - name: TOKENREVIEW_AUDIENCES
+              value: {{ join "," .Values.auth.tokenReview.audiences | quote }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.tls.enabled }}
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: {{ .Values.tls.certPath | default "/etc/tls/tls.crt" | quote }}
+            - name: TLS_KEY_PATH
+              value: {{ .Values.tls.keyPath | default "/etc/tls/tls.key" | quote }}
+          {{- end }}
             - name: BRIDGE_TOKEN_LEGACY_VARIANTS
               value: "{{ .Values.auth.legacyTokenVariants }}"
             - name: BACKEND_MODE
@@ -109,6 +134,11 @@ spec:
             - name: bridge-script
               mountPath: /app
               readOnly: true
+          {{- if and .Values.tls.enabled .Values.tls.existingSecret }}
+            - name: tls-certs
+              mountPath: /etc/tls
+              readOnly: true
+          {{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
       volumes:
@@ -116,3 +146,8 @@ spec:
           configMap:
             name: vaultwarden-eso-bridge-script
             defaultMode: 0555
+      {{- if and .Values.tls.enabled .Values.tls.existingSecret }}
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+      {{- end }}

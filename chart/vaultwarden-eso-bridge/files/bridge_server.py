@@ -24,13 +24,16 @@ import logging
 import os
 import re
 import secrets as secrets_mod
+import ssl
 import string
 import subprocess
 import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+import urllib.error
 from urllib.parse import unquote, urlparse
+import urllib.request
 
 LOGGER = logging.getLogger("vaultwarden-eso-bridge")
 
@@ -296,6 +299,128 @@ def load_mock_secrets(raw_json: str) -> Dict[str, Dict[str, str]]:
     return normalized
 
 
+class TokenReviewAuthenticator:
+    """Authenticates Kubernetes ServiceAccount tokens via the TokenReview API."""
+
+    def __init__(
+        self,
+        allowed_service_accounts: List[str],
+        *,
+        audiences: Optional[List[str]] = None,
+        cache_ttl_seconds: int = 300,
+        negative_cache_ttl_seconds: int = 10,
+        api_url: Optional[str] = None,
+        ca_path: Optional[str] = None,
+        token_path: Optional[str] = None,
+    ):
+        self.allowed_service_accounts = [sa.strip() for sa in allowed_service_accounts if sa.strip()]
+        self.audiences = audiences or []
+        self.cache_ttl_seconds = max(cache_ttl_seconds, 0)
+        self.negative_cache_ttl_seconds = max(negative_cache_ttl_seconds, 0)
+        self.api_url = (api_url or os.getenv("KUBERNETES_API_SERVER", "https://kubernetes.default.svc")).rstrip("/")
+        self.ca_path = ca_path or os.getenv("KUBERNETES_CA_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+        self.token_path = token_path or os.getenv("KUBERNETES_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Tuple[float, bool, str]] = {}
+
+    def _get_sa_token(self) -> Optional[str]:
+        if os.path.exists(self.token_path):
+            try:
+                with open(self.token_path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception as exc:
+                LOGGER.error("Failed to read in-pod ServiceAccount token at %s: %s", self.token_path, exc)
+        return None
+
+    def matches_service_account(self, username: str) -> bool:
+        """Check if username matches any allowed service account rule."""
+        if not username:
+            return False
+        for pattern in self.allowed_service_accounts:
+            if pattern == "*":
+                return True
+            if pattern == username:
+                return True
+            if username.startswith("system:serviceaccount:"):
+                sa_suffix = username[len("system:serviceaccount:"):]
+                if pattern in (sa_suffix, sa_suffix.replace(":", "/")):
+                    return True
+                if pattern.endswith(":*"):
+                    ns_prefix = pattern[:-2]
+                    if sa_suffix.startswith(f"{ns_prefix}:") or username.startswith(f"{ns_prefix}:"):
+                        return True
+                if pattern.endswith("/*"):
+                    ns_prefix = pattern[:-2]
+                    if sa_suffix.startswith(f"{ns_prefix}:"):
+                        return True
+        return False
+
+    def _review_token(self, token: str) -> Tuple[bool, str]:
+        url = f"{self.api_url}/apis/authentication.k8s.io/v1/tokenreviews"
+        payload: Dict[str, Any] = {
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenReview",
+            "spec": {
+                "token": token,
+            },
+        }
+        if self.audiences:
+            payload["spec"]["audiences"] = self.audiences
+
+        req_data = json.dumps(payload).encode("utf-8")
+        sa_token = self._get_sa_token()
+        if not sa_token:
+            LOGGER.error("TokenReview failed: in-pod ServiceAccount token not found at %s", self.token_path)
+            return False, ""
+
+        headers = {
+            "Authorization": f"Bearer {sa_token}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
+
+        ssl_context = None
+        if os.path.exists(self.ca_path):
+            ssl_context = ssl.create_default_context(cafile=self.ca_path)
+        else:
+            ssl_context = ssl.create_default_context()
+
+        try:
+            with urllib.request.urlopen(req, context=ssl_context, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                status = data.get("status", {})
+                authenticated = bool(status.get("authenticated"))
+                username = status.get("user", {}).get("username", "")
+                return authenticated, username
+        except Exception as exc:
+            LOGGER.error("Kubernetes TokenReview API request failed: %s", exc)
+            return False, ""
+
+    def authenticate(self, token: Optional[str]) -> bool:
+        if not token:
+            return False
+        now = time.time()
+        if self.cache_ttl_seconds > 0 or self.negative_cache_ttl_seconds > 0:
+            with self._lock:
+                cached = self._cache.get(token)
+                if cached and cached[0] > now:
+                    return cached[1]
+
+        authenticated, username = self._review_token(token)
+        allowed = authenticated and self.matches_service_account(username)
+
+        ttl = self.cache_ttl_seconds if allowed else self.negative_cache_ttl_seconds
+        if ttl > 0:
+            with self._lock:
+                self._cache[token] = (now + ttl, allowed, username)
+
+        if allowed:
+            LOGGER.debug("TokenReview authentication succeeded for user=%s", username)
+        else:
+            LOGGER.warning("TokenReview authentication rejected for user=%s (authenticated=%s)", username, authenticated)
+        return allowed
+
+
 class BridgeConfig:
     """Runtime config for bridge server."""
 
@@ -316,6 +441,13 @@ class BridgeConfig:
         bw_item_cache_ttl_seconds: int,
         bw_command_timeout_seconds: int,
         bw_negative_cache_ttl_seconds: int = 15,
+        tokenreview_enabled: bool = False,
+        allowed_service_accounts: Optional[List[str]] = None,
+        tokenreview_cache_ttl_seconds: int = 300,
+        tokenreview_audiences: Optional[List[str]] = None,
+        tls_enabled: bool = False,
+        tls_cert_path: str = "/etc/tls/tls.crt",
+        tls_key_path: str = "/etc/tls/tls.key",
     ):
         self.token = token
         self.token_legacy_variants = token_legacy_variants
@@ -333,6 +465,13 @@ class BridgeConfig:
         self.bw_item_cache_ttl_seconds = bw_item_cache_ttl_seconds
         self.bw_negative_cache_ttl_seconds = bw_negative_cache_ttl_seconds
         self.bw_command_timeout_seconds = bw_command_timeout_seconds
+        self.tokenreview_enabled = tokenreview_enabled
+        self.allowed_service_accounts = allowed_service_accounts or []
+        self.tokenreview_cache_ttl_seconds = tokenreview_cache_ttl_seconds
+        self.tokenreview_audiences = tokenreview_audiences or []
+        self.tls_enabled = tls_enabled
+        self.tls_cert_path = tls_cert_path
+        self.tls_key_path = tls_key_path
 
 
 class AuthMetrics:
@@ -1123,8 +1262,21 @@ def token_matches(
 def build_config_from_env() -> BridgeConfig:
     """Build BridgeConfig from environment."""
     token = os.getenv("BRIDGE_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("BRIDGE_TOKEN is required")
+    auth_mode = os.getenv("AUTH_MODE", "").strip().lower()
+    tokenreview_enabled = parse_bool_env("TOKENREVIEW_ENABLED", False) or auth_mode in ("tokenreview", "dual")
+
+    if not token and not tokenreview_enabled:
+        raise RuntimeError("Either BRIDGE_TOKEN or TOKENREVIEW_ENABLED must be configured for authentication")
+
+    allowed_sa_raw = os.getenv("ALLOWED_SERVICE_ACCOUNTS", "").strip()
+    allowed_service_accounts = (
+        [s.strip() for s in allowed_sa_raw.split(",") if s.strip()]
+        if allowed_sa_raw
+        else ["system:serviceaccount:external-secrets:external-secrets"]
+    )
+    audiences_raw = os.getenv("TOKENREVIEW_AUDIENCES", "").strip()
+    tokenreview_audiences = [a.strip() for a in audiences_raw.split(",") if a.strip()]
+
     return BridgeConfig(
         token=token,
         token_legacy_variants=parse_bool_env("BRIDGE_TOKEN_LEGACY_VARIANTS", False),
@@ -1141,6 +1293,13 @@ def build_config_from_env() -> BridgeConfig:
         bw_item_cache_ttl_seconds=parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0),
         bw_command_timeout_seconds=parse_positive_int_env("BW_COMMAND_TIMEOUT_SECONDS", 120),
         bw_negative_cache_ttl_seconds=parse_non_negative_int_env("BW_NEGATIVE_CACHE_TTL_SECONDS", 15),
+        tokenreview_enabled=tokenreview_enabled,
+        allowed_service_accounts=allowed_service_accounts,
+        tokenreview_cache_ttl_seconds=parse_non_negative_int_env("TOKENREVIEW_CACHE_TTL_SECONDS", 300),
+        tokenreview_audiences=tokenreview_audiences,
+        tls_enabled=parse_bool_env("TLS_ENABLED", False),
+        tls_cert_path=os.getenv("TLS_CERT_PATH", "/etc/tls/tls.crt").strip(),
+        tls_key_path=os.getenv("TLS_KEY_PATH", "/etc/tls/tls.key").strip(),
     )
 
 
@@ -1170,6 +1329,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
     token: str = ""
     token_legacy_variants: bool = False
+    token_review_authenticator: Optional[TokenReviewAuthenticator] = None
     backend: SecretBackend
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -1207,11 +1367,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
         presented = extract_bearer_token(header)
-        return token_matches(
-            self.token,
-            presented,
-            legacy_variants=self.token_legacy_variants,
-        )
+        if not presented:
+            return False
+        if self.token and token_matches(self.token, presented, legacy_variants=self.token_legacy_variants):
+            return True
+        if self.token_review_authenticator and self.token_review_authenticator.authenticate(presented):
+            return True
+        return False
 
     def do_GET(self) -> None:  # noqa: N802
         start_time = time.time()
@@ -1455,15 +1617,31 @@ def run() -> None:
     config = build_config_from_env()
     backend = build_backend(config)
     port = int(os.getenv("BRIDGE_PORT", "8080"))
+
+    tokenreview_auth = None
+    if config.tokenreview_enabled:
+        tokenreview_auth = TokenReviewAuthenticator(
+            allowed_service_accounts=config.allowed_service_accounts,
+            audiences=config.tokenreview_audiences,
+            cache_ttl_seconds=config.tokenreview_cache_ttl_seconds,
+        )
+        LOGGER.info(
+            "TokenReview authenticator enabled for service accounts: %s (cache_ttl=%ss)",
+            config.allowed_service_accounts,
+            config.tokenreview_cache_ttl_seconds,
+        )
+
     LOGGER.info(
         "starting vaultwarden bridge backend_mode=%s port=%s cache_ttl=%ss "
-        "neg_cache_ttl=%ss cmd_timeout=%ss token_legacy_variants=%s",
+        "neg_cache_ttl=%ss cmd_timeout=%ss token_auth=%s tokenreview_auth=%s tls=%s",
         config.backend_mode,
         port,
         config.bw_item_cache_ttl_seconds,
         config.bw_negative_cache_ttl_seconds,
         config.bw_command_timeout_seconds,
-        config.token_legacy_variants,
+        bool(config.token),
+        config.tokenreview_enabled,
+        config.tls_enabled,
     )
     if config.token_legacy_variants:
         LOGGER.warning(
@@ -1473,8 +1651,20 @@ def run() -> None:
 
     BridgeRequestHandler.token = config.token
     BridgeRequestHandler.token_legacy_variants = config.token_legacy_variants
+    BridgeRequestHandler.token_review_authenticator = tokenreview_auth
     BridgeRequestHandler.backend = backend
     server = ThreadingHTTPServer(("0.0.0.0", port), BridgeRequestHandler)
+
+    if config.tls_enabled:
+        if not os.path.exists(config.tls_cert_path) or not os.path.exists(config.tls_key_path):
+            raise RuntimeError(
+                f"TLS enabled but certificate files not found: cert={config.tls_cert_path}, key={config.tls_key_path}"
+            )
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=config.tls_cert_path, keyfile=config.tls_key_path)
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        LOGGER.info("TLS server wrapper active (cert=%s)", config.tls_cert_path)
+
     server.serve_forever()
 
 

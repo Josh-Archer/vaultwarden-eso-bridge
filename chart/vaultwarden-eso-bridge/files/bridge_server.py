@@ -4,10 +4,11 @@
 Serves a single-purpose HTTP endpoint that resolves Vaultwarden secrets by path
 for External Secrets Operator Webhook providers.
 
-Endpoints:
   GET /v1/secret/{namespace}/{secret}/{key}             - Single value lookup
   GET /v1/secret/{namespace}/{secret}                   - Multi-key bulk JSON dictionary
   GET /v1/secret/{namespace}/{secret}/attachment/{file} - Binary file attachment
+  POST /v1/admin/ensure                                 - Verify/create items and populate missing fields
+  POST /v1/admin/rotate                                 - Rotate passwords/fields on targeted items
   GET /healthz                                          - Liveness probe
   GET /readyz (or /ready)                               - Readiness probe
   GET /metrics                                          - Prometheus metrics
@@ -22,6 +23,8 @@ import json
 import logging
 import os
 import re
+import secrets as secrets_mod
+import string
 import subprocess
 import tempfile
 import threading
@@ -462,6 +465,12 @@ class AuthMetrics:
         return "\n".join(lines) + "\n"
 
 
+
+def generate_password(length: int = 32) -> str:
+    """Generate a cryptographically random alphanumeric+symbol password."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    return "".join(secrets_mod.choice(alphabet) for _ in range(length))
+
 class SecretBackend:
     """Secret backend interface."""
 
@@ -474,6 +483,18 @@ class SecretBackend:
         raise NotImplementedError
 
     def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
+        raise NotImplementedError
+
+    def ensure_item(
+        self, item_name: str, fields: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Verify item exists and populate missing fields. Returns action report."""
+        raise NotImplementedError
+
+    def rotate_item(
+        self, item_name: str, field_names: List[str], length: int = 32
+    ) -> Dict[str, Any]:
+        """Rotate specified fields on an item with new random values. Returns action report."""
         raise NotImplementedError
 
     def is_ready(self) -> bool:
@@ -522,6 +543,30 @@ class MockBackend(SecretBackend):
         if isinstance(val, str):
             val = val.encode("utf-8")
         return val, "application/octet-stream"
+
+    def ensure_item(
+        self, item_name: str, fields: Dict[str, str]
+    ) -> Dict[str, Any]:
+        created = item_name not in self.secrets
+        if created:
+            self.secrets[item_name] = {}
+        populated: List[str] = []
+        for key, default_value in fields.items():
+            if key not in self.secrets[item_name]:
+                self.secrets[item_name][key] = default_value
+                populated.append(key)
+        return {"item": item_name, "created": created, "populated": populated}
+
+    def rotate_item(
+        self, item_name: str, field_names: List[str], length: int = 32
+    ) -> Dict[str, Any]:
+        if item_name not in self.secrets:
+            raise SecretLookupError(f"Item '{item_name}' not found")
+        rotated: List[str] = []
+        for field in field_names:
+            self.secrets[item_name][field] = generate_password(length)
+            rotated.append(field)
+        return {"item": item_name, "rotated": rotated}
 
 
 class BwCliBackend(SecretBackend):
@@ -853,6 +898,127 @@ class BwCliBackend(SecretBackend):
 
         return content, "application/octet-stream"
 
+    def ensure_item(
+        self, item_name: str, fields: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Verify item exists; create if missing; populate absent fields."""
+        self._run_bw_raw(["sync"], tolerate_failure=True)
+        created = False
+        populated: List[str] = []
+
+        # Try to find existing item
+        try:
+            items = self._run_bw_json(["list", "items", "--search", item_name])
+            selected = self._select_item(items, item_name)
+        except SecretLookupError:
+            # Create new login item
+            folder_id = self._resolve_folder_id()
+            new_item: Dict[str, Any] = {
+                "type": 1,  # Login
+                "name": item_name,
+                "login": {"username": "", "password": ""},
+                "fields": [],
+                "notes": None,
+            }
+            if folder_id:
+                new_item["folderId"] = folder_id
+            if self.org_id:
+                new_item["organizationId"] = self.org_id
+            encoded = base64.b64encode(json.dumps(new_item).encode()).decode()
+            result = self._run_bw_json(["create", "item", encoded])
+            selected = result
+            created = True
+
+        # Populate missing fields
+        item_fields = selected.get("fields") or []
+        existing_names = {f.get("name") for f in item_fields}
+        login = selected.get("login") or {}
+        login_keys = {"username", "password"}
+
+        changed = False
+        for key, default_value in fields.items():
+            if key in login_keys:
+                current = login.get(key)
+                if not current:
+                    login[key] = default_value
+                    changed = True
+                    populated.append(key)
+            elif key == "notes":
+                if not selected.get("notes"):
+                    selected["notes"] = default_value
+                    changed = True
+                    populated.append(key)
+            elif key not in existing_names:
+                item_fields.append({"name": key, "value": default_value, "type": 0})
+                changed = True
+                populated.append(key)
+
+        if changed:
+            selected["login"] = login
+            selected["fields"] = item_fields
+            item_id = selected.get("id", "")
+            encoded = base64.b64encode(json.dumps(selected).encode()).decode()
+            self._run_bw_json(["edit", "item", item_id, encoded])
+            self._run_bw_raw(["sync"], tolerate_failure=True)
+            # Invalidate cache
+            with self._cache_lock:
+                self._item_cache.clear()
+
+        LOGGER.info(
+            "admin ensure item=%s created=%s populated=%s",
+            item_name, created, populated,
+        )
+        return {"item": item_name, "created": created, "populated": populated}
+
+    def rotate_item(
+        self, item_name: str, field_names: List[str], length: int = 32
+    ) -> Dict[str, Any]:
+        """Rotate specified fields on an item with new random values."""
+        self._run_bw_raw(["sync"], tolerate_failure=True)
+        items = self._run_bw_json(["list", "items", "--search", item_name])
+        selected = self._select_item(items, item_name)
+
+        item_fields = selected.get("fields") or []
+        login = selected.get("login") or {}
+        login_keys = {"username", "password"}
+        rotated: List[str] = []
+
+        for field in field_names:
+            new_value = generate_password(length)
+            if field in login_keys:
+                login[field] = new_value
+                rotated.append(field)
+            elif field == "notes":
+                selected["notes"] = new_value
+                rotated.append(field)
+            else:
+                found = False
+                for f in item_fields:
+                    if f.get("name") == field:
+                        f["value"] = new_value
+                        found = True
+                        break
+                if not found:
+                    item_fields.append({"name": field, "value": new_value, "type": 0})
+                rotated.append(field)
+
+        selected["login"] = login
+        selected["fields"] = item_fields
+        item_id = selected.get("id", "")
+        encoded = base64.b64encode(json.dumps(selected).encode()).decode()
+        self._run_bw_json(["edit", "item", item_id, encoded])
+        self._run_bw_raw(["sync"], tolerate_failure=True)
+
+        # Invalidate cache
+        with self._cache_lock:
+            self._item_cache.clear()
+
+        LOGGER.info(
+            "admin rotate item=%s rotated=%s",
+            item_name, rotated,
+        )
+        return {"item": item_name, "rotated": rotated}
+
 
 def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
     """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""
@@ -1032,6 +1198,12 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
         presented = extract_bearer_token(header)
@@ -1162,6 +1334,112 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 LOGGER.exception("bridge request failed path=%s", self.path)
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        finally:
+            duration = time.time() - start_time
+            if hasattr(self.backend, "metrics") and self.backend.metrics is not None:
+                self.backend.metrics.record_request(matched_path, int(status_code), duration)
+
+    def do_POST(self) -> None:  # noqa: N802
+        start_time = time.time()
+        status_code = HTTPStatus.OK
+        matched_path = self.path
+
+        try:
+            if not self._authorized():
+                status_code = HTTPStatus.UNAUTHORIZED
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+
+            raw = self._read_body()
+            if not raw:
+                status_code = HTTPStatus.BAD_REQUEST
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": "empty request body"})
+                return
+
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                status_code = HTTPStatus.BAD_REQUEST
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
+                return
+
+            if self.path == "/v1/admin/ensure":
+                matched_path = "/v1/admin/ensure"
+                items = body.get("items")
+                if not isinstance(items, list) or not items:
+                    status_code = HTTPStatus.BAD_REQUEST
+                    self._write_json(HTTPStatus.BAD_REQUEST, {
+                        "error": "body must contain 'items' array",
+                        "example": {"items": [{"name": "ns/secret", "fields": {"key": "default"}}]},
+                    })
+                    return
+                results = []
+                for entry in items:
+                    name = entry.get("name", "")
+                    fields = entry.get("fields", {})
+                    if not name or not isinstance(fields, dict):
+                        status_code = HTTPStatus.BAD_REQUEST
+                        self._write_json(HTTPStatus.BAD_REQUEST, {
+                            "error": f"each item needs 'name' (str) and 'fields' (object), got: {entry}",
+                        })
+                        return
+                    result = self.backend.ensure_item(name, fields)
+                    results.append(result)
+                LOGGER.info("admin ensure completed items=%d", len(results))
+                self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+
+            elif self.path == "/v1/admin/rotate":
+                matched_path = "/v1/admin/rotate"
+                items = body.get("items")
+                pw_length = int(body.get("length", 32))
+                if not isinstance(items, list) or not items:
+                    status_code = HTTPStatus.BAD_REQUEST
+                    self._write_json(HTTPStatus.BAD_REQUEST, {
+                        "error": "body must contain 'items' array",
+                        "example": {"items": [{"name": "ns/secret", "fields": ["password"]}], "length": 32},
+                    })
+                    return
+                results = []
+                for entry in items:
+                    name = entry.get("name", "")
+                    field_names = entry.get("fields", [])
+                    if not name or not isinstance(field_names, list) or not field_names:
+                        status_code = HTTPStatus.BAD_REQUEST
+                        self._write_json(HTTPStatus.BAD_REQUEST, {
+                            "error": f"each item needs 'name' (str) and 'fields' (list), got: {entry}",
+                        })
+                        return
+                    result = self.backend.rotate_item(name, field_names, pw_length)
+                    results.append(result)
+                LOGGER.info("admin rotate completed items=%d", len(results))
+                self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+
+            else:
+                status_code = HTTPStatus.NOT_FOUND
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": f"unknown admin route: {self.path}"})
+
+        except AuthError as exc:
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            LOGGER.error("admin auth failure path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except SecretLookupError as exc:
+            status_code = HTTPStatus.NOT_FOUND
+            LOGGER.warning("admin lookup failed path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.NOT_FOUND, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except BridgeError as exc:
+            status_code = HTTPStatus.BAD_GATEWAY
+            LOGGER.error("admin failure path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.BAD_GATEWAY, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except Exception as exc:  # pragma: no cover
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            LOGGER.exception("admin request failed path=%s", self.path)
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         finally:
             duration = time.time() - start_time
             if hasattr(self.backend, "metrics") and self.backend.metrics is not None:

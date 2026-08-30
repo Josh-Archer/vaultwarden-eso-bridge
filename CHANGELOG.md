@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.3.0...v0.4.0) (2026-08-30)
+
+
+### Features
+
+* **security:** Kubernetes ServiceAccount TokenReview authentication and TLS ([#27](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/27)) ([#36](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/36)) ([a59e784](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/a59e7848ca1399e2c71ef03432ae1a5cd9acda28))
+
 ## [0.3.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.2.0...v0.3.0) (2026-08-30)
 
 

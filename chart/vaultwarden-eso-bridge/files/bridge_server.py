@@ -24,8 +24,10 @@ import logging
 import os
 import re
 import secrets as secrets_mod
+import socket
 import ssl
 import string
+import struct
 import subprocess
 import tempfile
 import threading
@@ -461,6 +463,11 @@ class BridgeConfig:
         tls_enabled: bool = False,
         tls_cert_path: str = "/etc/tls/tls.crt",
         tls_key_path: str = "/etc/tls/tls.key",
+        websocket_sync_enabled: bool = False,
+        websocket_url: str = "",
+        websocket_token: str = "",
+        websocket_reconnect_interval_seconds: float = 5.0,
+        websocket_ssl_verify: bool = True,
     ):
         self.token = token
         self.token_legacy_variants = token_legacy_variants
@@ -492,6 +499,11 @@ class BridgeConfig:
         self.tls_enabled = tls_enabled
         self.tls_cert_path = tls_cert_path
         self.tls_key_path = tls_key_path
+        self.websocket_sync_enabled = websocket_sync_enabled
+        self.websocket_url = websocket_url
+        self.websocket_token = websocket_token
+        self.websocket_reconnect_interval_seconds = websocket_reconnect_interval_seconds
+        self.websocket_ssl_verify = websocket_ssl_verify
 
 
 class AuthMetrics:
@@ -506,8 +518,17 @@ class AuthMetrics:
         self.cache_hits_total = 0
         self.cache_misses_total = 0
         self.negative_cache_hits_total = 0
+        self.websocket_notifications_total = 0
+        self.websocket_connected = False
         self.request_latencies: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
+    def record_websocket_notification(self) -> None:
+        with self._lock:
+            self.websocket_notifications_total += 1
+
+    def set_websocket_connected(self, connected: bool) -> None:
+        with self._lock:
+            self.websocket_connected = connected
     def record_success(self) -> None:
         with self._lock:
             self.auth_refresh_success_total += 1
@@ -554,6 +575,8 @@ class AuthMetrics:
                 "cache_hits_total": self.cache_hits_total,
                 "cache_misses_total": self.cache_misses_total,
                 "negative_cache_hits_total": self.negative_cache_hits_total,
+                "websocket_notifications_total": self.websocket_notifications_total,
+                "websocket_connected": self.websocket_connected,
             }
 
     def render_prometheus(self, *, session_ready: Optional[bool] = None) -> str:
@@ -563,6 +586,8 @@ class AuthMetrics:
             cache_hits = self.cache_hits_total
             cache_misses = self.cache_misses_total
             neg_hits = self.negative_cache_hits_total
+            ws_notifications = self.websocket_notifications_total
+            ws_connected = self.websocket_connected
             latencies = {
                 k: {
                     "count": v["count"],
@@ -589,6 +614,12 @@ class AuthMetrics:
             "# HELP bridge_negative_cache_hits_total In-process negative (404) cache hit counter",
             "# TYPE bridge_negative_cache_hits_total counter",
             f"bridge_negative_cache_hits_total {neg_hits}",
+            "# HELP bridge_websocket_notifications_total Total Vaultwarden WebSocket notifications received",
+            "# TYPE bridge_websocket_notifications_total counter",
+            f"bridge_websocket_notifications_total {ws_notifications}",
+            "# HELP bridge_websocket_connected Whether the Vaultwarden WebSocket listener is connected (1/0)",
+            "# TYPE bridge_websocket_connected gauge",
+            f"bridge_websocket_connected {1 if ws_connected else 0}",
         ]
         if session_ready is not None:
             lines.extend(
@@ -671,6 +702,10 @@ class SecretBackend:
         """Return True when the backend can serve secret lookups."""
         return True
 
+
+    def invalidate_cache(self) -> None:
+        """Clear in-memory cache upon receiving WebSocket change event."""
+        pass
     def metrics_text(self) -> str:
         """Prometheus text exposition for backend-specific metrics."""
         return self.metrics.render_prometheus(session_ready=self.is_ready())
@@ -761,6 +796,9 @@ class MockBackend(SecretBackend):
             return {"item": secret_path, "key": key, "status": "deleted"}
         self.secrets.pop(secret_path, None)
         return {"item": secret_path, "status": "deleted"}
+
+    def invalidate_cache(self) -> None:
+        pass
 
 
 class BwCliBackend(SecretBackend):
@@ -1292,6 +1330,12 @@ class BwCliBackend(SecretBackend):
         except SecretLookupError:
             return {"item": item_name, "status": "not_found"}
 
+    def invalidate_cache(self) -> None:
+        with self._cache_lock:
+            self._item_cache.clear()
+        LOGGER.info("BwCliBackend cache invalidated via WebSocket event")
+        threading.Thread(target=self._run_bw_raw, args=(["sync"],), kwargs={"tolerate_failure": True}, daemon=True).start()
+
 
 
 class BwsBackend(SecretBackend):
@@ -1656,6 +1700,236 @@ class BwsBackend(SecretBackend):
         except SecretLookupError:
             return {"item": item_name, "status": "not_found"}
 
+    def invalidate_cache(self) -> None:
+        with self._cache_lock:
+            self._item_cache.clear()
+        LOGGER.info("BwsBackend cache invalidated via WebSocket event")
+
+
+class VaultwardenWebSocketClient:
+    """Event-driven SignalR WebSocket client for Vaultwarden /notifications/hub."""
+
+    def __init__(
+        self,
+        server_url: str,
+        token: Optional[str] = None,
+        on_notification: Optional[Any] = None,
+        reconnect_interval_seconds: float = 5.0,
+        max_reconnect_interval_seconds: float = 60.0,
+        ssl_verify: bool = True,
+        metrics: Optional[AuthMetrics] = None,
+    ):
+        self.server_url = server_url.strip()
+        self.token = token.strip() if token else None
+        self.on_notification = on_notification
+        self.reconnect_interval = max(float(reconnect_interval_seconds), 1.0)
+        self.max_reconnect_interval = max(float(max_reconnect_interval_seconds), self.reconnect_interval)
+        self.ssl_verify = ssl_verify
+        self.metrics = metrics
+        self._running = False
+        self._connected = False
+        self._thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
+        self._lock = threading.Lock()
+        self.notification_count = 0
+
+    def is_connected(self) -> bool:
+        with self._lock:
+            return self._connected
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._thread = threading.Thread(target=self._run_loop, name="vw-websocket-client", daemon=True)
+            self._thread.start()
+            LOGGER.info("Vaultwarden WebSocket listener thread started for %s", self.server_url)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+            self._connected = False
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        if self.metrics:
+            self.metrics.set_websocket_connected(False)
+        LOGGER.info("Vaultwarden WebSocket listener stopped")
+
+    def _create_connection(self) -> socket.socket:
+        parsed = urlparse(self.server_url)
+        scheme = parsed.scheme.lower()
+        is_ssl = scheme in ("wss", "https")
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if is_ssl else 80)
+        path = parsed.path or "/notifications/hub"
+        if parsed.query:
+            path += f"?{parsed.query}"
+
+        raw_sock = socket.create_connection((host, port), timeout=15)
+        if is_ssl:
+            context = ssl.create_default_context()
+            if not self.ssl_verify:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(raw_sock, server_hostname=host)
+        else:
+            sock = raw_sock
+
+        sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host}:{port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {sec_key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if self.token:
+            headers.append(f"Authorization: Bearer {self.token}")
+        headers.extend(["", ""])
+        handshake_payload = "\r\n".join(headers).encode("ascii")
+        sock.sendall(handshake_payload)
+
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise ConnectionError("Server closed connection during WebSocket handshake")
+            response += chunk
+
+        first_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        if not (" 101 " in first_line or first_line.endswith(" 101")):
+            raise ConnectionError(f"WebSocket handshake rejected by server: {first_line}")
+
+        return sock
+
+    def _send_ws_frame(self, sock: socket.socket, payload: bytes, opcode: int = 0x1) -> None:
+        """Send a client-to-server masked WebSocket frame."""
+        mask_key = os.urandom(4)
+        masked_payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        length = len(payload)
+
+        header = bytearray()
+        header.append(0x80 | (opcode & 0x0F))  # FIN + opcode
+        if length < 126:
+            header.append(0x80 | length)  # MASK = 1 + len
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        header.extend(mask_key)
+        sock.sendall(header + masked_payload)
+
+    def _recv_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < num_bytes:
+            chunk = sock.recv(num_bytes - len(buf))
+            if not chunk:
+                raise ConnectionError("Connection closed while reading WebSocket frame")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _recv_ws_frame(self, sock: socket.socket) -> Tuple[int, bytes]:
+        """Receive a WebSocket frame (opcode, payload)."""
+        header = self._recv_exact(sock, 2)
+        opcode = header[0] & 0x0F
+        has_mask = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
+
+        if has_mask:
+            mask_key = self._recv_exact(sock, 4)
+            raw_payload = self._recv_exact(sock, length)
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(raw_payload))
+        else:
+            payload = self._recv_exact(sock, length)
+
+        return opcode, payload
+
+    def _run_loop(self) -> None:
+        backoff = self.reconnect_interval
+        while self._running:
+            sock = None
+            try:
+                LOGGER.info("Connecting to Vaultwarden WebSocket at %s...", self.server_url)
+                sock = self._create_connection()
+                with self._lock:
+                    self._sock = sock
+                    self._connected = True
+                if self.metrics:
+                    self.metrics.set_websocket_connected(True)
+                LOGGER.info("Vaultwarden WebSocket connected successfully")
+                backoff = self.reconnect_interval
+
+                # SignalR Handshake
+                signalr_handshake = json.dumps({"protocol": "json", "version": 1}) + "\x1e"
+                self._send_ws_frame(sock, signalr_handshake.encode("utf-8"), opcode=0x1)
+
+                buffer = ""
+                while self._running:
+                    opcode, frame_data = self._recv_ws_frame(sock)
+                    if opcode == 0x8:  # CLOSE
+                        break
+                    elif opcode == 0x9:  # PING
+                        self._send_ws_frame(sock, frame_data, opcode=0xA)  # PONG
+                    elif opcode == 0x1:  # TEXT
+                        buffer += frame_data.decode("utf-8", errors="replace")
+                        while "\x1e" in buffer:
+                            msg_str, buffer = buffer.split("\x1e", 1)
+                            msg_str = msg_str.strip()
+                            if not msg_str:
+                                continue
+                            try:
+                                msg = json.loads(msg_str)
+                                msg_type = msg.get("type")
+                                if msg_type == 6:  # SignalR Ping
+                                    self._send_ws_frame(sock, b'{"type":6}\x1e', opcode=0x1)
+                                elif msg_type == 1:  # Invocation
+                                    target = msg.get("target", "")
+                                    args = msg.get("arguments", [])
+                                    LOGGER.info("Vaultwarden WebSocket event received: target=%s args=%s", target, args)
+                                    self.notification_count += 1
+                                    if self.metrics:
+                                        self.metrics.record_websocket_notification()
+                                    if self.on_notification:
+                                        try:
+                                            self.on_notification(target, args)
+                                        except Exception as exc:
+                                            LOGGER.error("Error in on_notification callback: %s", exc)
+                            except json.JSONDecodeError:
+                                pass
+            except Exception as exc:
+                if self._running:
+                    LOGGER.warning("Vaultwarden WebSocket connection lost: %s (reconnecting in %.1fs)", exc, backoff)
+            finally:
+                with self._lock:
+                    self._connected = False
+                    if self._sock:
+                        try:
+                            self._sock.close()
+                        except Exception:
+                            pass
+                        self._sock = None
+                if self.metrics:
+                    self.metrics.set_websocket_connected(False)
+
+            if self._running:
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, self.max_reconnect_interval)
+
 def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
     """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""
     parsed = urlparse(path)
@@ -1774,6 +2048,17 @@ def build_config_from_env() -> BridgeConfig:
     audiences_raw = os.getenv("TOKENREVIEW_AUDIENCES", "").strip()
     tokenreview_audiences = [a.strip() for a in audiences_raw.split(",") if a.strip()]
 
+    ws_url = os.getenv("VAULTWARDEN_WS_URL", "").strip()
+    if not ws_url:
+        srv = os.getenv("VAULTWARDEN_SERVER", os.getenv("BW_SERVER", "")).strip()
+        if srv:
+            if srv.startswith("https://"):
+                ws_url = "wss://" + srv[8:].rstrip("/") + "/notifications/hub"
+            elif srv.startswith("http://"):
+                ws_url = "ws://" + srv[7:].rstrip("/") + "/notifications/hub"
+            else:
+                ws_url = "wss://" + srv.rstrip("/") + "/notifications/hub"
+
     return BridgeConfig(
         token=token,
         token_legacy_variants=parse_bool_env("BRIDGE_TOKEN_LEGACY_VARIANTS", False),
@@ -1804,6 +2089,11 @@ def build_config_from_env() -> BridgeConfig:
         tls_enabled=parse_bool_env("TLS_ENABLED", False),
         tls_cert_path=os.getenv("TLS_CERT_PATH", "/etc/tls/tls.crt").strip(),
         tls_key_path=os.getenv("TLS_KEY_PATH", "/etc/tls/tls.key").strip(),
+        websocket_sync_enabled=parse_bool_env("WEBSOCKET_SYNC_ENABLED", False),
+        websocket_url=ws_url,
+        websocket_token=os.getenv("WEBSOCKET_TOKEN", "").strip(),
+        websocket_reconnect_interval_seconds=float(os.getenv("WEBSOCKET_RECONNECT_INTERVAL_SECONDS", "5.0")),
+        websocket_ssl_verify=parse_bool_env("WEBSOCKET_SSL_VERIFY", True),
     )
 
 
@@ -2240,6 +2530,21 @@ def run() -> None:
     BridgeRequestHandler.token_legacy_variants = config.token_legacy_variants
     BridgeRequestHandler.token_review_authenticator = tokenreview_auth
     BridgeRequestHandler.backend = backend
+    ws_client = None
+    if config.websocket_sync_enabled and config.websocket_url:
+        def _on_ws_notification(target: str, args: List[Any]) -> None:
+            backend.invalidate_cache()
+
+        ws_client = VaultwardenWebSocketClient(
+            server_url=config.websocket_url,
+            token=config.websocket_token or config.bw_session or config.bws_access_token,
+            on_notification=_on_ws_notification,
+            reconnect_interval_seconds=config.websocket_reconnect_interval_seconds,
+            ssl_verify=config.websocket_ssl_verify,
+            metrics=backend.metrics if hasattr(backend, "metrics") else None,
+        )
+        ws_client.start()
+
     server = ThreadingHTTPServer(("0.0.0.0", port), BridgeRequestHandler)
 
     if config.tls_enabled:

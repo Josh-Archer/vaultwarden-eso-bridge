@@ -955,5 +955,263 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(h_att_bin.responses[0]["body"], b"MOCK_CERT_BYTES")
         self.assertEqual(h_att_bin.responses[0]["headers"]["Content-Type"], "application/octet-stream")
 
+
+    def test_admin_ensure_creates_and_populates(self):
+        """Test POST /v1/admin/ensure creates items and populates missing fields."""
+        backend = bridge.MockBackend(secrets={})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "admin-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _AdminHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, body, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+                self._body = body
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _read_body(self):
+                return self._body
+
+            def _write_json(self, status, payload):
+                import json as _json
+                self.responses.append(
+                    {"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+        # Ensure: create new item with fields
+        import json as _json
+        body = _json.dumps({
+            "items": [
+                {"name": "media/plex", "fields": {"username": "admin", "api_key": "default-key"}}
+            ]
+        }).encode()
+        h = _AdminHandler("/v1/admin/ensure", body, {"Authorization": "Bearer admin-token"})
+        h.do_POST()
+        self.assertEqual(h.responses[-1]["status"], 200)
+        result = h.responses[-1]["payload"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["results"]), 1)
+        self.assertTrue(result["results"][0]["created"])
+        self.assertIn("username", result["results"][0]["populated"])
+        self.assertIn("api_key", result["results"][0]["populated"])
+
+        # Verify item was created in mock
+        self.assertEqual(backend.secrets["media/plex"]["username"], "admin")
+        self.assertEqual(backend.secrets["media/plex"]["api_key"], "default-key")
+
+        # Ensure again: fields already exist, nothing populated
+        h2 = _AdminHandler("/v1/admin/ensure", body, {"Authorization": "Bearer admin-token"})
+        h2.do_POST()
+        self.assertEqual(h2.responses[-1]["status"], 200)
+        r2 = h2.responses[-1]["payload"]
+        self.assertFalse(r2["results"][0]["created"])
+        self.assertEqual(r2["results"][0]["populated"], [])
+
+    def test_admin_rotate_updates_fields(self):
+        """Test POST /v1/admin/rotate rotates specified fields."""
+        backend = bridge.MockBackend(secrets={
+            "media/plex": {"username": "admin", "password": "old-pass", "api_key": "old-key"}
+        })
+        handler = bridge.BridgeRequestHandler
+        handler.token = "admin-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _AdminHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, body, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+                self._body = body
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _read_body(self):
+                return self._body
+
+            def _write_json(self, status, payload):
+                import json as _json
+                self.responses.append(
+                    {"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+        import json as _json
+        body = _json.dumps({
+            "items": [{"name": "media/plex", "fields": ["password", "api_key"]}],
+            "length": 16,
+        }).encode()
+        h = _AdminHandler("/v1/admin/rotate", body, {"Authorization": "Bearer admin-token"})
+        h.do_POST()
+        self.assertEqual(h.responses[-1]["status"], 200)
+        result = h.responses[-1]["payload"]
+        self.assertTrue(result["ok"])
+        self.assertIn("password", result["results"][0]["rotated"])
+        self.assertIn("api_key", result["results"][0]["rotated"])
+
+        # Values should have changed
+        self.assertNotEqual(backend.secrets["media/plex"]["password"], "old-pass")
+        self.assertNotEqual(backend.secrets["media/plex"]["api_key"], "old-key")
+        # New values should be 16 chars
+        self.assertEqual(len(backend.secrets["media/plex"]["password"]), 16)
+        self.assertEqual(len(backend.secrets["media/plex"]["api_key"]), 16)
+        # Username unchanged
+        self.assertEqual(backend.secrets["media/plex"]["username"], "admin")
+
+    def test_admin_rotate_not_found(self):
+        """Test POST /v1/admin/rotate returns 404 for missing item."""
+        backend = bridge.MockBackend(secrets={})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "admin-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _AdminHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, body, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+                self._body = body
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _read_body(self):
+                return self._body
+
+            def _write_json(self, status, payload):
+                import json as _json
+                self.responses.append(
+                    {"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+        import json as _json
+        body = _json.dumps({
+            "items": [{"name": "nonexistent/item", "fields": ["password"]}],
+        }).encode()
+        h = _AdminHandler("/v1/admin/rotate", body, {"Authorization": "Bearer admin-token"})
+        h.do_POST()
+        self.assertEqual(h.responses[-1]["status"], 404)
+
+    def test_admin_unauthorized(self):
+        """Test POST /v1/admin/* returns 401 without valid token."""
+        backend = bridge.MockBackend(secrets={})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "admin-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _AdminHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, body, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+                self._body = body
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _read_body(self):
+                return self._body
+
+            def _write_json(self, status, payload):
+                import json as _json
+                self.responses.append(
+                    {"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+        import json as _json
+        body = _json.dumps({"items": [{"name": "a/b", "fields": {"x": "y"}}]}).encode()
+        h = _AdminHandler("/v1/admin/ensure", body, {"Authorization": "Bearer wrong-token"})
+        h.do_POST()
+        self.assertEqual(h.responses[-1]["status"], 401)
+
+    def test_admin_invalid_body(self):
+        """Test POST /v1/admin/ensure with invalid body returns 400."""
+        backend = bridge.MockBackend(secrets={})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "admin-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _AdminHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, body, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+                self._body = body
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _read_body(self):
+                return self._body
+
+            def _write_json(self, status, payload):
+                import json as _json
+                self.responses.append(
+                    {"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+        # Empty body
+        h1 = _AdminHandler("/v1/admin/ensure", b"", {"Authorization": "Bearer admin-token"})
+        h1.do_POST()
+        self.assertEqual(h1.responses[-1]["status"], 400)
+
+        # Invalid JSON
+        h2 = _AdminHandler("/v1/admin/ensure", b"not json", {"Authorization": "Bearer admin-token"})
+        h2.do_POST()
+        self.assertEqual(h2.responses[-1]["status"], 400)
+
+        # Missing items array
+        import json as _json
+        h3 = _AdminHandler("/v1/admin/ensure", _json.dumps({"foo": "bar"}).encode(), {"Authorization": "Bearer admin-token"})
+        h3.do_POST()
+        self.assertEqual(h3.responses[-1]["status"], 400)
+
+    def test_generate_password(self):
+        """Test generate_password produces expected-length passwords."""
+        pw16 = bridge.generate_password(16)
+        self.assertEqual(len(pw16), 16)
+        pw64 = bridge.generate_password(64)
+        self.assertEqual(len(pw64), 64)
+        # Two generated passwords should be different (with overwhelming probability)
+        self.assertNotEqual(pw16, bridge.generate_password(16))
+
 if __name__ == "__main__":
     unittest.main()

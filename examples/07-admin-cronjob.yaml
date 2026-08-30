@@ -1,0 +1,73 @@
+# Lightweight CronJob that calls the bridge admin endpoints.
+# Replaces the heavyweight node:24-bookworm-slim + npm install @bitwarden/cli CronJob.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vaultwarden-bridge-admin
+  namespace: secrets-platform
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+spec:
+  schedule: "0 3 1 * *"  # Monthly at 03:00 on the 1st
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: vaultwarden-eso-bridge
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: admin
+              image: curlimages/curl:8.11.0
+              env:
+                - name: BRIDGE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: eso-bridge-auth
+                      key: token
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  BRIDGE_URL="http://vaultwarden-eso-bridge.secrets-platform.svc:8080"
+
+                  echo "==> Running ensure..."
+                  curl -sf -X POST "$BRIDGE_URL/v1/admin/ensure" \
+                    -H "Authorization: Bearer $BRIDGE_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "items": [
+                        {
+                          "name": "media/plex",
+                          "fields": {
+                            "username": "",
+                            "password": "",
+                            "api_key": ""
+                          }
+                        }
+                      ]
+                    }'
+                  echo ""
+
+                  echo "==> Running rotate..."
+                  curl -sf -X POST "$BRIDGE_URL/v1/admin/rotate" \
+                    -H "Authorization: Bearer $BRIDGE_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "items": [
+                        {
+                          "name": "media/plex",
+                          "fields": ["api_key"]
+                        }
+                      ],
+                      "length": 48
+                    }'
+                  echo ""
+                  echo "==> Admin operations complete."

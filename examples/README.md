@@ -14,6 +14,7 @@ Full walkthrough (mock mode, `bw-cli` mode, NetworkPolicy, token rotation):
 | `03-clustersecretstore.yaml` | Webhook `ClusterSecretStore` |
 | `04-externalsecret.yaml` | Single-key `ExternalSecret` |
 | `05-externalsecret-multi-key.yaml` | Multi-key `ExternalSecret` |
+| `06-externalsecret-bulk-datafrom.yaml` | Bulk multi-key `ExternalSecret` via `dataFrom.extract` |
 | `values-mock.yaml` | Helm values for mock backend |
 | `values-bw-cli.yaml` | Helm values for Vaultwarden backend |
 

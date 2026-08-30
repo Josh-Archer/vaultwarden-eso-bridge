@@ -16,8 +16,10 @@ BRIDGE_PATH = (
 
 
 def _load_module():
+    import sys
     spec = importlib.util.spec_from_file_location("bridge_server", BRIDGE_PATH)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["bridge_server"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
@@ -247,7 +249,7 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
         self.assertFalse(calls[0][1]["include_session"])
 
-    def _make_bw_backend(self, *, cache_ttl_seconds: int = 120) -> "bridge.BwCliBackend":
+    def _make_bw_backend(self, *, cache_ttl_seconds: int = 120, negative_cache_ttl_seconds: int = 15) -> "bridge.BwCliBackend":
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
                 return bridge.BwCliBackend(
@@ -261,6 +263,7 @@ class BridgeUnitTests(unittest.TestCase):
                     bw_session="preseeded-session",
                     cache_ttl_seconds=cache_ttl_seconds,
                     command_timeout_seconds=20,
+                    negative_cache_ttl_seconds=negative_cache_ttl_seconds,
                 )
 
     def test_parse_non_negative_int_env_allows_zero(self):
@@ -728,6 +731,229 @@ class BridgeUnitTests(unittest.TestCase):
 
         self.assertIn("Re-authenticate", ctx.exception.hint)
 
+
+
+    def test_extract_all_values_from_bw_item(self):
+        item = {
+            "notes": "some notes",
+            "login": {
+                "username": "user",
+                "password": "pass",
+                "totp": "123456",
+                "uris": [{"uri": "https://vault.example.com"}],
+            },
+            "fields": [
+                {"name": "API_KEY", "value": "secret-api-key"},
+                {"name": "EMPTY_FIELD", "value": None},
+                {"name": "PORT", "value": 8080},
+            ],
+        }
+        extracted = bridge.extract_all_values_from_bw_item(item)
+        self.assertEqual(extracted["username"], "user")
+        self.assertEqual(extracted["login.username"], "user")
+        self.assertEqual(extracted["password"], "pass")
+        self.assertEqual(extracted["totp"], "123456")
+        self.assertEqual(extracted["uri"], "https://vault.example.com")
+        self.assertEqual(extracted["notes"], "some notes")
+        self.assertEqual(extracted["API_KEY"], "secret-api-key")
+        self.assertEqual(extracted["PORT"], "8080")
+        self.assertNotIn("EMPTY_FIELD", extracted)
+
+    def test_parse_secret_path_bulk_and_attachment(self):
+        # Bulk lookup
+        ns, secret, key = bridge.parse_secret_path("/v1/secret/media/plex")
+        self.assertEqual((ns, secret, key), ("media", "plex", None))
+
+        # Attachment lookup
+        ns, secret, key = bridge.parse_secret_path("/v1/secret/media/plex/attachment/cert.pem")
+        self.assertEqual((ns, secret, key), ("media", "plex", "attachment/cert.pem"))
+
+    def test_mock_backend_bulk_and_attachment(self):
+        secrets = {
+            "media/plex": {
+                "username": "plexuser",
+                "token": "plextoken",
+            }
+        }
+        attachments = {
+            "media/plex": {
+                "cert.pem": b"-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----",
+            }
+        }
+        backend = bridge.MockBackend(secrets, attachments=attachments)
+
+        # Bulk
+        all_vals = backend.get_all_values("media", "plex")
+        self.assertEqual(all_vals, {"username": "plexuser", "token": "plextoken"})
+
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_all_values("media", "missing")
+
+        # Attachment
+        raw_bytes, mime = backend.get_attachment("media", "plex", "cert.pem")
+        self.assertIn(b"BEGIN CERTIFICATE", raw_bytes)
+        self.assertEqual(mime, "application/octet-stream")
+
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_attachment("media", "plex", "missing.pem")
+
+    def test_bw_cli_backend_negative_caching(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=60, negative_cache_ttl_seconds=60)
+
+        with patch.object(backend, "_run_bw_json", side_effect=bridge.SecretLookupError("not found")):
+            # First lookup: misses cache, fails and stores negative cache
+            with self.assertRaises(bridge.SecretLookupError):
+                backend.get_value("media", "missing-secret", "token")
+            self.assertEqual(backend.metrics.cache_misses_total, 1)
+            self.assertEqual(backend.metrics.negative_cache_hits_total, 0)
+
+            # Second lookup within TTL: hits negative cache immediately without calling _run_bw_json again
+            with self.assertRaises(bridge.SecretLookupError):
+                backend.get_value("media", "missing-secret", "token")
+            self.assertEqual(backend.metrics.cache_misses_total, 1)
+            self.assertEqual(backend.metrics.negative_cache_hits_total, 1)
+
+    def test_bw_cli_backend_get_all_values(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=60)
+        item_payload = {
+            "name": "media/plex",
+            "login": {"username": "plexuser", "password": "plexpassword"},
+            "fields": [{"name": "TOKEN", "value": "plextoken123"}],
+        }
+        with patch.object(backend, "_lookup_item", return_value=item_payload):
+            values = backend.get_all_values("media", "plex")
+            self.assertEqual(values["username"], "plexuser")
+            self.assertEqual(values["password"], "plexpassword")
+            self.assertEqual(values["TOKEN"], "plextoken123")
+
+    def test_bw_cli_backend_get_attachment(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=60)
+        item_payload = {
+            "id": "item-12345",
+            "name": "media/plex",
+            "attachments": [{"id": "att-1", "fileName": "tls.crt", "size": 1024}],
+        }
+        with patch.object(backend, "_lookup_item", return_value=item_payload):
+            def mock_run_bw_raw(args, **kwargs):
+                if "attachment" in args:
+                    out_idx = args.index("--output") + 1
+                    with open(args[out_idx], "wb") as f:
+                        f.write(b"MOCK_TLS_CERT_DATA")
+                    return ""
+                return ""
+
+            with patch.object(backend, "_run_bw_raw", side_effect=mock_run_bw_raw):
+                content, mime = backend.get_attachment("media", "plex", "tls.crt")
+                self.assertEqual(content, b"MOCK_TLS_CERT_DATA")
+                self.assertEqual(mime, "application/octet-stream")
+
+            # Missing attachment error
+            with self.assertRaises(bridge.SecretLookupError):
+                backend.get_attachment("media", "plex", "missing.key")
+
+    def test_auth_metrics_histogram_and_counters(self):
+        metrics = bridge.AuthMetrics()
+        metrics.record_cache_hit()
+        metrics.record_cache_miss()
+        metrics.record_negative_cache_hit()
+        metrics.record_request("/v1/secret", 200, 0.015)
+        metrics.record_request("/v1/secret", 404, 0.002)
+
+        prom_text = metrics.render_prometheus(session_ready=True)
+        self.assertIn("bridge_cache_hits_total 1", prom_text)
+        self.assertIn("bridge_cache_misses_total 1", prom_text)
+        self.assertIn("bridge_negative_cache_hits_total 1", prom_text)
+        self.assertIn("bridge_bw_session_ready 1", prom_text)
+        self.assertIn("bridge_request_duration_seconds_bucket", prom_text)
+        self.assertIn('path="/v1/secret",status="200"', prom_text)
+        self.assertIn('path="/v1/secret",status="404"', prom_text)
+
+
+    def test_handler_bulk_json_and_attachment_endpoints(self):
+        backend = bridge.MockBackend(
+            secrets={
+                "default/app-secrets": {
+                    "username": "admin",
+                    "password": "secretpassword",
+                    "api_key": "key123",
+                }
+            },
+            attachments={
+                "default/app-secrets": {
+                    "ca.crt": b"MOCK_CERT_BYTES",
+                }
+            },
+        )
+        handler = bridge.BridgeRequestHandler
+        handler.token = "valid-token"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _TestHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                self.responses[-1]["body"] = b""
+
+            def _write_json(self, status, payload):
+                import json as _json
+                body = _json.dumps(payload).encode("utf-8")
+                self.responses.append(
+                    {"status": status, "body": body, "payload": payload, "headers": {"Content-Type": "application/json"}}
+                )
+
+            def _write_bytes(self, status, body, content_type="application/octet-stream"):
+                self.responses.append(
+                    {"status": status, "body": body, "headers": {"Content-Type": content_type}}
+                )
+
+            def _write_text(self, status, body, content_type):
+                self.responses.append(
+                    {"status": status, "body": body.encode("utf-8"), "headers": {"Content-Type": content_type}}
+                )
+
+        # 1. Bulk multi-key JSON request
+        h_bulk = _TestHandler("/v1/secret/default/app-secrets", {"Authorization": "Bearer valid-token"})
+        h_bulk.do_GET()
+        self.assertEqual(len(h_bulk.responses), 1)
+        self.assertEqual(h_bulk.responses[0]["status"], 200)
+        payload = h_bulk.responses[0]["payload"]
+        self.assertIn("data", payload)
+        self.assertEqual(payload["data"]["username"], "admin")
+        self.assertEqual(payload["data"]["password"], "secretpassword")
+        self.assertEqual(payload["data"]["api_key"], "key123")
+        self.assertEqual(payload["username"], "admin")
+
+        # 2. Attachment request with default JSON response (base64)
+        h_att_json = _TestHandler("/v1/secret/default/app-secrets/attachment/ca.crt", {"Authorization": "Bearer valid-token"})
+        h_att_json.do_GET()
+        self.assertEqual(len(h_att_json.responses), 1)
+        self.assertEqual(h_att_json.responses[0]["status"], 200)
+        att_payload = h_att_json.responses[0]["payload"]
+        self.assertEqual(att_payload["filename"], "ca.crt")
+        self.assertEqual(att_payload["size"], len(b"MOCK_CERT_BYTES"))
+        import base64 as _base64
+        self.assertEqual(_base64.b64decode(att_payload["value"]), b"MOCK_CERT_BYTES")
+
+        # 3. Attachment request with binary Accept header
+        h_att_bin = _TestHandler(
+            "/v1/secret/default/app-secrets/attachment/ca.crt",
+            {"Authorization": "Bearer valid-token", "Accept": "application/octet-stream"},
+        )
+        h_att_bin.do_GET()
+        self.assertEqual(len(h_att_bin.responses), 1)
+        self.assertEqual(h_att_bin.responses[0]["status"], 200)
+        self.assertEqual(h_att_bin.responses[0]["body"], b"MOCK_CERT_BYTES")
+        self.assertEqual(h_att_bin.responses[0]["headers"]["Content-Type"], "application/octet-stream")
 
 if __name__ == "__main__":
     unittest.main()

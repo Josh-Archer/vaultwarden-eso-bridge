@@ -71,6 +71,8 @@ spec:
           {{- end }}
             - name: BW_ITEM_CACHE_TTL_SECONDS
               value: "{{ .Values.backend.bwCli.itemCacheTtlSeconds }}"
+            - name: BW_NEGATIVE_CACHE_TTL_SECONDS
+              value: "{{ .Values.backend.bwCli.negativeCacheTtlSeconds | default 15 }}"
             - name: BW_COMMAND_TIMEOUT_SECONDS
               value: "{{ .Values.backend.bwCli.commandTimeoutSeconds }}"
           {{- end }}

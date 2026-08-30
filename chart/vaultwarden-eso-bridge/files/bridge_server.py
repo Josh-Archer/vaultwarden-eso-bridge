@@ -1,64 +1,80 @@
 #!/usr/bin/env python3
-"""Vaultwarden ESO webhook bridge.
+"""Vaultwarden External Secrets Operator (ESO) HTTP Bridge.
 
-This bridge is intentionally backend-agnostic:
-- mock mode for deterministic CI and local tests
-- bw-cli mode for Vaultwarden/Bitwarden-backed lookups
+Serves a single-purpose HTTP endpoint that resolves Vaultwarden secrets by path
+for External Secrets Operator Webhook providers.
+
+Endpoints:
+  GET /v1/secret/{namespace}/{secret}/{key}             - Single value lookup
+  GET /v1/secret/{namespace}/{secret}                   - Multi-key bulk JSON dictionary
+  GET /v1/secret/{namespace}/{secret}/attachment/{file} - Binary file attachment
+  GET /healthz                                          - Liveness probe
+  GET /readyz (or /ready)                               - Readiness probe
+  GET /metrics                                          - Prometheus metrics
 """
 
+from __future__ import annotations
+
 import base64
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import threading
 import time
-from dataclasses import dataclass
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse
 
-
-LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger("vaultwarden-eso-bridge")
 
 
 class BridgeError(RuntimeError):
-    """Base class for bridge operational errors with optional operator hints."""
+    """Base error for bridge exceptions."""
 
     code = "bridge_error"
 
-    def __init__(self, message: str, *, hint: str = ""):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        hint: Optional[str] = None,
+    ):
         super().__init__(message)
+        if code:
+            self.code = code
         self.hint = hint
 
     def log_message(self) -> str:
-        """Format message plus actionable next steps for operators."""
         if self.hint:
             return f"{self} | next_steps: {self.hint}"
         return str(self)
 
 
 class SecretLookupError(BridgeError):
-    """Raised when a secret/item/key cannot be resolved."""
+    """Raised when a secret path, key, or attachment is not found."""
 
     code = "secret_not_found"
 
 
 class AuthError(BridgeError):
-    """Raised when bw CLI authentication/session/unlock fails."""
+    """Raised on authentication or authorization failure with Vaultwarden."""
 
     code = "auth_error"
 
 
 class InvalidJsonError(BridgeError):
-    """Raised when bw CLI returns stdout that is not valid JSON."""
+    """Raised when bw CLI returns invalid JSON stdout."""
 
     code = "invalid_json"
 
 
 class BwCliError(BridgeError):
-    """Raised for non-auth bw CLI command failures."""
+    """Generic failure executing bw CLI command."""
 
     code = "bw_cli_error"
 
@@ -151,43 +167,64 @@ def classify_bw_cli_failure(detail: str) -> BridgeError:
     )
 
 
-def load_mock_secrets(raw: str) -> Dict[str, Dict[str, str]]:
-    """Parse mock secret map from JSON string."""
-    if not raw:
-        return {}
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise ValueError("MOCK_SECRETS_JSON must be a JSON object")
-    normalized: Dict[str, Dict[str, str]] = {}
-    for path, values in parsed.items():
-        if not isinstance(path, str) or not isinstance(values, dict):
-            raise ValueError("MOCK_SECRETS_JSON items must be path -> object")
-        normalized[path] = {str(k): str(v) for k, v in values.items()}
-    return normalized
-
-
 def extract_value_from_bw_item(item: Dict, key: str) -> Optional[str]:
-    """Resolve a key from a Bitwarden item object."""
+    """Resolve a single key from a Bitwarden item object."""
     for field in item.get("fields", []) or []:
         if field.get("name") == key and field.get("value") is not None:
             return str(field.get("value"))
 
     login = item.get("login", {}) or {}
-    if key in ("username", "login.username") and login.get("username"):
+    if key in ("username", "login.username") and login.get("username") is not None:
         return str(login["username"])
-    if key in ("password", "login.password") and login.get("password"):
+    if key in ("password", "login.password") and login.get("password") is not None:
         return str(login["password"])
-    if key in ("totp", "login.totp") and login.get("totp"):
+    if key in ("totp", "login.totp") and login.get("totp") is not None:
         return str(login["totp"])
     if key in ("uri", "login.uri"):
         uris = login.get("uris") or []
-        if uris and isinstance(uris[0], dict) and uris[0].get("uri"):
+        if uris and isinstance(uris[0], dict) and uris[0].get("uri") is not None:
             return str(uris[0]["uri"])
 
-    if key == "notes" and item.get("notes"):
+    if key == "notes" and item.get("notes") is not None:
         return str(item["notes"])
 
     return None
+
+
+def extract_all_values_from_bw_item(item: Dict) -> Dict[str, str]:
+    """Extract all resolvable properties and custom fields from a Bitwarden item."""
+    data: Dict[str, str] = {}
+
+    login = item.get("login", {}) or {}
+    if login.get("username") is not None:
+        val = str(login["username"])
+        data["username"] = val
+        data["login.username"] = val
+    if login.get("password") is not None:
+        val = str(login["password"])
+        data["password"] = val
+        data["login.password"] = val
+    if login.get("totp") is not None:
+        val = str(login["totp"])
+        data["totp"] = val
+        data["login.totp"] = val
+
+    uris = login.get("uris") or []
+    if uris and isinstance(uris[0], dict) and uris[0].get("uri") is not None:
+        val = str(uris[0]["uri"])
+        data["uri"] = val
+        data["login.uri"] = val
+
+    if item.get("notes") is not None:
+        data["notes"] = str(item["notes"])
+
+    for field in item.get("fields", []) or []:
+        fname = field.get("name")
+        fval = field.get("value")
+        if fname and fval is not None:
+            data[str(fname)] = str(fval)
+
+    return data
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
@@ -229,33 +266,85 @@ def parse_non_negative_int_env(name: str, default: int) -> int:
     return value if value >= 0 else default
 
 
-@dataclass
+def load_mock_secrets(raw_json: str) -> Dict[str, Dict[str, str]]:
+    """Parse MOCK_SECRETS_JSON mapping."""
+    if not raw_json:
+        return {
+            "default/app-secrets": {
+                "api_key": "mock-api-key-12345",
+                "database_url": "postgres://user:pass@db:5432/app",
+                "username": "mock-user",
+                "password": "mock-password",
+            }
+        }
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid MOCK_SECRETS_JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("MOCK_SECRETS_JSON must be a JSON object")
+
+    normalized: Dict[str, Dict[str, str]] = {}
+    for secret_path, fields in data.items():
+        if not isinstance(fields, dict):
+            raise RuntimeError(f"Secret entry '{secret_path}' must be a JSON object")
+        normalized[secret_path] = {str(k): str(v) for k, v in fields.items()}
+    return normalized
+
+
 class BridgeConfig:
     """Runtime config for bridge server."""
 
-    token: str
-    token_legacy_variants: bool
-    backend_mode: str
-    item_name_template: str
-    mock_secrets: Dict[str, Dict[str, str]]
-    vaultwarden_folder: str
-    vaultwarden_org_id: str
-    bw_server: str
-    bw_email: str
-    bw_password: str
-    bw_session: str
-    bw_path: str
-    bw_item_cache_ttl_seconds: int
-    bw_command_timeout_seconds: int
+    def __init__(
+        self,
+        token: str,
+        token_legacy_variants: bool,
+        backend_mode: str,
+        item_name_template: str,
+        mock_secrets: Dict[str, Dict[str, str]],
+        vaultwarden_folder: str,
+        vaultwarden_org_id: str,
+        bw_server: str,
+        bw_email: str,
+        bw_password: str,
+        bw_session: str,
+        bw_path: str,
+        bw_item_cache_ttl_seconds: int,
+        bw_command_timeout_seconds: int,
+        bw_negative_cache_ttl_seconds: int = 15,
+    ):
+        self.token = token
+        self.token_legacy_variants = token_legacy_variants
+        self.backend_mode = backend_mode
+        self.item_name_template = item_name_template
+        self.mock_secrets = mock_secrets
+        self.vaultwarden_folder = vaultwarden_folder
+        self.vaultwarden_org_id = vaultwarden_org_id
+        self.bw_server = bw_server
+        self.bw_email = bw_email
+        self.bw_password = bw_password
+        self.bw_session = bw_session
+        self.session = bw_session
+        self.bw_path = bw_path
+        self.bw_item_cache_ttl_seconds = bw_item_cache_ttl_seconds
+        self.bw_negative_cache_ttl_seconds = bw_negative_cache_ttl_seconds
+        self.bw_command_timeout_seconds = bw_command_timeout_seconds
 
 
 class AuthMetrics:
-    """Thread-safe counters for bw-cli session refresh outcomes."""
+    """Thread-safe counters and latency histograms for bridge requests and auth."""
+
+    HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.auth_refresh_success_total = 0
         self.auth_refresh_failure_total = 0
+        self.cache_hits_total = 0
+        self.cache_misses_total = 0
+        self.negative_cache_hits_total = 0
+        self.request_latencies: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     def record_success(self) -> None:
         with self._lock:
@@ -265,22 +354,79 @@ class AuthMetrics:
         with self._lock:
             self.auth_refresh_failure_total += 1
 
-    def snapshot(self) -> Dict[str, int]:
+    def record_cache_hit(self) -> None:
+        with self._lock:
+            self.cache_hits_total += 1
+
+    def record_cache_miss(self) -> None:
+        with self._lock:
+            self.cache_misses_total += 1
+
+    def record_negative_cache_hit(self) -> None:
+        with self._lock:
+            self.negative_cache_hits_total += 1
+
+    def record_request(self, path: str, status: int, duration_seconds: float) -> None:
+        with self._lock:
+            key = (path, status)
+            if key not in self.request_latencies:
+                self.request_latencies[key] = {
+                    "count": 0,
+                    "sum": 0.0,
+                    "buckets": {b: 0 for b in self.HISTOGRAM_BUCKETS},
+                    "inf": 0,
+                }
+            entry = self.request_latencies[key]
+            entry["count"] += 1
+            entry["sum"] += duration_seconds
+            entry["inf"] += 1
+            for b in self.HISTOGRAM_BUCKETS:
+                if duration_seconds <= b:
+                    entry["buckets"][b] += 1
+
+    def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "auth_refresh_success_total": self.auth_refresh_success_total,
                 "auth_refresh_failure_total": self.auth_refresh_failure_total,
+                "cache_hits_total": self.cache_hits_total,
+                "cache_misses_total": self.cache_misses_total,
+                "negative_cache_hits_total": self.negative_cache_hits_total,
             }
 
     def render_prometheus(self, *, session_ready: Optional[bool] = None) -> str:
-        snap = self.snapshot()
+        with self._lock:
+            auth_success = self.auth_refresh_success_total
+            auth_failure = self.auth_refresh_failure_total
+            cache_hits = self.cache_hits_total
+            cache_misses = self.cache_misses_total
+            neg_hits = self.negative_cache_hits_total
+            latencies = {
+                k: {
+                    "count": v["count"],
+                    "sum": v["sum"],
+                    "inf": v["inf"],
+                    "buckets": dict(v["buckets"]),
+                }
+                for k, v in self.request_latencies.items()
+            }
+
         lines = [
             "# HELP bridge_auth_refresh_success_total Successful bw-cli session refresh attempts",
             "# TYPE bridge_auth_refresh_success_total counter",
-            f"bridge_auth_refresh_success_total {snap['auth_refresh_success_total']}",
+            f"bridge_auth_refresh_success_total {auth_success}",
             "# HELP bridge_auth_refresh_failure_total Failed bw-cli session refresh attempts",
             "# TYPE bridge_auth_refresh_failure_total counter",
-            f"bridge_auth_refresh_failure_total {snap['auth_refresh_failure_total']}",
+            f"bridge_auth_refresh_failure_total {auth_failure}",
+            "# HELP bridge_cache_hits_total In-process secret cache hit counter",
+            "# TYPE bridge_cache_hits_total counter",
+            f"bridge_cache_hits_total {cache_hits}",
+            "# HELP bridge_cache_misses_total In-process secret cache miss counter",
+            "# TYPE bridge_cache_misses_total counter",
+            f"bridge_cache_misses_total {cache_misses}",
+            "# HELP bridge_negative_cache_hits_total In-process negative (404) cache hit counter",
+            "# TYPE bridge_negative_cache_hits_total counter",
+            f"bridge_negative_cache_hits_total {neg_hits}",
         ]
         if session_ready is not None:
             lines.extend(
@@ -290,13 +436,44 @@ class AuthMetrics:
                     f"bridge_bw_session_ready {1 if session_ready else 0}",
                 ]
             )
+
+        if latencies:
+            lines.extend(
+                [
+                    "# HELP bridge_request_duration_seconds HTTP request latency histogram in seconds",
+                    "# TYPE bridge_request_duration_seconds histogram",
+                ]
+            )
+            for (path, status), entry in sorted(latencies.items()):
+                for b in self.HISTOGRAM_BUCKETS:
+                    lines.append(
+                        f'bridge_request_duration_seconds_bucket{{path="{path}",status="{status}",le="{b}"}} {entry["buckets"][b]}'
+                    )
+                lines.append(
+                    f'bridge_request_duration_seconds_bucket{{path="{path}",status="{status}",le="+Inf"}} {entry["inf"]}'
+                )
+                lines.append(
+                    f'bridge_request_duration_seconds_sum{{path="{path}",status="{status}"}} {entry["sum"]:.6f}'
+                )
+                lines.append(
+                    f'bridge_request_duration_seconds_count{{path="{path}",status="{status}"}} {entry["count"]}'
+                )
+
         return "\n".join(lines) + "\n"
 
 
 class SecretBackend:
     """Secret backend interface."""
 
+    metrics: AuthMetrics
+
     def get_value(self, namespace: str, secret: str, key: str) -> str:
+        raise NotImplementedError
+
+    def get_all_values(self, namespace: str, secret: str) -> Dict[str, str]:
+        raise NotImplementedError
+
+    def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
         raise NotImplementedError
 
     def is_ready(self) -> bool:
@@ -305,21 +482,21 @@ class SecretBackend:
 
     def metrics_text(self) -> str:
         """Prometheus text exposition for backend-specific metrics."""
-        return (
-            "# HELP bridge_auth_refresh_success_total Successful bw-cli session refresh attempts\n"
-            "# TYPE bridge_auth_refresh_success_total counter\n"
-            "bridge_auth_refresh_success_total 0\n"
-            "# HELP bridge_auth_refresh_failure_total Failed bw-cli session refresh attempts\n"
-            "# TYPE bridge_auth_refresh_failure_total counter\n"
-            "bridge_auth_refresh_failure_total 0\n"
-        )
+        return self.metrics.render_prometheus(session_ready=self.is_ready())
 
 
 class MockBackend(SecretBackend):
     """In-memory backend for deterministic tests."""
 
-    def __init__(self, secrets: Dict[str, Dict[str, str]]):
+    def __init__(
+        self,
+        secrets: Dict[str, Dict[str, str]],
+        attachments: Optional[Dict[str, Dict[str, Union[bytes, str]]]] = None,
+        metrics: Optional[AuthMetrics] = None,
+    ):
         self.secrets = secrets
+        self.attachments = attachments or {}
+        self.metrics = metrics or AuthMetrics()
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         secret_path = f"{namespace}/{secret}"
@@ -330,6 +507,21 @@ class MockBackend(SecretBackend):
                 f"Key '{key}' not found in secret path '{secret_path}'"
             )
         return self.secrets[secret_path][key]
+
+    def get_all_values(self, namespace: str, secret: str) -> Dict[str, str]:
+        secret_path = f"{namespace}/{secret}"
+        if secret_path not in self.secrets:
+            raise SecretLookupError(f"Secret path '{secret_path}' not found")
+        return dict(self.secrets[secret_path])
+
+    def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
+        secret_path = f"{namespace}/{secret}"
+        if secret_path not in self.attachments or filename not in self.attachments[secret_path]:
+            raise SecretLookupError(f"Attachment '{filename}' not found on item '{secret_path}'")
+        val = self.attachments[secret_path][filename]
+        if isinstance(val, str):
+            val = val.encode("utf-8")
+        return val, "application/octet-stream"
 
 
 class BwCliBackend(SecretBackend):
@@ -348,6 +540,7 @@ class BwCliBackend(SecretBackend):
         cache_ttl_seconds: int,
         command_timeout_seconds: int,
         metrics: Optional[AuthMetrics] = None,
+        negative_cache_ttl_seconds: int = 15,
     ):
         self.bw_path = bw_path
         self.folder_name = folder_name
@@ -357,8 +550,8 @@ class BwCliBackend(SecretBackend):
         self.bw_email = bw_email
         self.bw_password = bw_password
         self.session = bw_session
-        # 0 disables the optional in-process item/key cache (safe default).
         self.cache_ttl_seconds = max(int(cache_ttl_seconds), 0)
+        self.negative_cache_ttl_seconds = max(int(negative_cache_ttl_seconds), 0)
         self.command_timeout_seconds = max(command_timeout_seconds, 1)
         self.metrics = metrics or AuthMetrics()
         self._folder_id: Optional[str] = None
@@ -366,9 +559,8 @@ class BwCliBackend(SecretBackend):
         self._bw_lock = threading.Lock()
         self._ready_lock = threading.Lock()
         self._session_ready = False
-        # Keys are always scoped by Kubernetes namespace + secret name so
-        # tenants never share cache entries even if itemNameTemplate collides.
-        self._item_cache: Dict[Tuple[str, str], Tuple[float, Dict]] = {}
+        # Cache entries: (expiry_timestamp, Optional[Dict[item]], Optional[SecretLookupError])
+        self._item_cache: Dict[Tuple[str, str], Tuple[float, Optional[Dict], Optional[SecretLookupError]]] = {}
 
         self._bootstrap_auth(record_metric=False)
         self._set_session_ready(True)
@@ -438,7 +630,6 @@ class BwCliBackend(SecretBackend):
             try:
                 stdout = self._run_bw_raw(args)
             except AuthError as exc:
-                # bw CLI can lose auth state at runtime; re-bootstrap and retry once.
                 if attempt == 0 and "You are not logged in." in str(exc):
                     self._refresh_session()
                     continue
@@ -450,7 +641,6 @@ class BwCliBackend(SecretBackend):
             try:
                 return json.loads(stdout)
             except json.JSONDecodeError as exc:
-                # Some bw-cli auth failures can surface as non-JSON stdout.
                 if attempt == 0:
                     self._refresh_session()
                     continue
@@ -501,7 +691,6 @@ class BwCliBackend(SecretBackend):
                         self._set_session_ready(True)
                     return
                 except SecretLookupError:
-                    # Fall back to email/password auth when a preseeded session cannot sync.
                     self.session = ""
             self.session = ""
             if not self.bw_email or not self.bw_password:
@@ -521,7 +710,6 @@ class BwCliBackend(SecretBackend):
                     extra_env=password_env,
                 ).strip()
             except BridgeError as exc:
-                # bw may persist account metadata and require unlock instead of login.
                 if "already logged in" not in str(exc).lower():
                     raise
                 session = self._run_bw_raw(
@@ -584,33 +772,40 @@ class BwCliBackend(SecretBackend):
                 return self._select_item(items, item_name)
             except SecretLookupError:
                 if attempt == 0:
-                    # Newly created Vaultwarden items can require an explicit sync.
                     self._run_bw_raw(["sync"], tolerate_failure=True)
                     continue
                 raise
         raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
 
     def _get_item_cached(self, namespace: str, secret: str, item_name: str) -> Dict:
-        """Return item, optionally serving from a short TTL cache.
-
-        Cache entries are keyed by (namespace, secret) so concurrent callers
-        for different tenants never share a slot. TTL of 0 disables caching.
-        """
-        if self.cache_ttl_seconds <= 0:
-            return self._lookup_item(item_name)
-
+        """Return item, optionally serving from TTL cache with negative caching support."""
         cache_key = (namespace, secret)
         now = time.time()
-        with self._cache_lock:
-            cached = self._item_cache.get(cache_key)
-            if cached and cached[0] > now:
-                return cached[1]
 
-        # Fetch outside the lock so concurrent cache hits are not blocked on bw CLI.
-        selected = self._lookup_item(item_name)
-        with self._cache_lock:
-            self._item_cache[cache_key] = (time.time() + self.cache_ttl_seconds, selected)
-        return selected
+        if self.cache_ttl_seconds > 0 or self.negative_cache_ttl_seconds > 0:
+            with self._cache_lock:
+                cached = self._item_cache.get(cache_key)
+                if cached and cached[0] > now:
+                    _, item, neg_err = cached
+                    if neg_err is not None:
+                        self.metrics.record_negative_cache_hit()
+                        raise neg_err
+                    if item is not None:
+                        self.metrics.record_cache_hit()
+                        return item
+
+        self.metrics.record_cache_miss()
+        try:
+            selected = self._lookup_item(item_name)
+            if self.cache_ttl_seconds > 0:
+                with self._cache_lock:
+                    self._item_cache[cache_key] = (time.time() + self.cache_ttl_seconds, selected, None)
+            return selected
+        except SecretLookupError as exc:
+            if self.negative_cache_ttl_seconds > 0:
+                with self._cache_lock:
+                    self._item_cache[cache_key] = (time.time() + self.negative_cache_ttl_seconds, None, exc)
+            raise
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         item_name = self.item_template.format(namespace=namespace, secret=secret)
@@ -621,25 +816,85 @@ class BwCliBackend(SecretBackend):
             raise SecretLookupError(f"Key '{key}' not found on item '{item_name}'")
         return value
 
+    def get_all_values(self, namespace: str, secret: str) -> Dict[str, str]:
+        item_name = self.item_template.format(namespace=namespace, secret=secret)
+        selected = self._get_item_cached(namespace, secret, item_name)
+        return extract_all_values_from_bw_item(selected)
 
-def parse_secret_path(path: str) -> Tuple[str, str, str]:
-    """Parse /v1/secret/{namespace}/{secret}/{key} path."""
+    def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
+        item_name = self.item_template.format(namespace=namespace, secret=secret)
+        selected = self._get_item_cached(namespace, secret, item_name)
+
+        attachments = selected.get("attachments", []) or []
+        target = None
+        for att in attachments:
+            if att.get("fileName") == filename or att.get("id") == filename:
+                target = att
+                break
+
+        if not target:
+            raise SecretLookupError(f"Attachment '{filename}' not found on item '{item_name}'")
+
+        item_id = selected.get("id")
+        if not item_id:
+            raise SecretLookupError(f"Item ID missing on item '{item_name}'")
+
+        target_name = target.get("fileName") or filename
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = os.path.join(tmpdir, target_name)
+            self._run_bw_raw(
+                ["get", "attachment", target_name, "--itemid", item_id, "--output", out_file],
+                tolerate_failure=False,
+            )
+            if not os.path.exists(out_file):
+                raise SecretLookupError(f"Failed to retrieve attachment '{filename}' from item '{item_name}'")
+            with open(out_file, "rb") as f:
+                content = f.read()
+
+        return content, "application/octet-stream"
+
+
+def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
+    """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""
     parsed = urlparse(path)
     prefix = "/v1/secret/"
     if not parsed.path.startswith(prefix):
-        raise ValueError("Expected /v1/secret/{namespace}/{secret}/{key}")
-    remainder = parsed.path[len(prefix) :]
-    if "/" not in remainder:
-        raise ValueError("Expected /v1/secret/{namespace}/{secret}/{key}")
-    secret_path_enc, key_enc = remainder.rsplit("/", 1)
-    secret_path = unquote(secret_path_enc)
-    key = unquote(key_enc)
-    if "/" not in secret_path:
-        raise ValueError("Expected /v1/secret/{namespace}/{secret}/{key}")
-    namespace, secret = secret_path.split("/", 1)
-    if not namespace or not secret or not key:
-        raise ValueError("Expected /v1/secret/{namespace}/{secret}/{key}")
-    return namespace, secret, key
+        raise ValueError("Expected /v1/secret/{namespace}/{secret} or /v1/secret/{namespace}/{secret}/{key}")
+    remainder = parsed.path[len(prefix) :].strip("/")
+    if not remainder:
+        raise ValueError("Expected /v1/secret/{namespace}/{secret} or /v1/secret/{namespace}/{secret}/{key}")
+
+    # Attachment request: /v1/secret/{namespace}/{secret}/attachment/{filename}
+    if "/attachment/" in remainder:
+        parts = remainder.split("/attachment/", 1)
+        secret_path = unquote(parts[0])
+        filename = unquote(parts[1])
+        if "/" not in secret_path:
+            raise ValueError("Expected /v1/secret/{namespace}/{secret}/attachment/{filename}")
+        namespace, secret = secret_path.split("/", 1)
+        if not namespace or not secret or not filename:
+            raise ValueError("Expected /v1/secret/{namespace}/{secret}/attachment/{filename}")
+        return namespace, secret, f"attachment/{filename}"
+
+    # Split from right to check for 3-part path or encoded secret_ref
+    if "/" in remainder:
+        secret_path_enc, last_part_enc = remainder.rsplit("/", 1)
+        secret_path = unquote(secret_path_enc)
+        last_part = unquote(last_part_enc)
+
+        if "/" in secret_path:
+            namespace, secret = secret_path.split("/", 1)
+            if namespace and secret and last_part:
+                return namespace, secret, last_part
+
+    # 2-part bulk path: /v1/secret/{namespace}/{secret}
+    unquoted_remainder = unquote(remainder)
+    if "/" in unquoted_remainder:
+        namespace, secret = unquoted_remainder.split("/", 1)
+        if namespace and secret:
+            return namespace, secret, None
+
+    raise ValueError("Expected /v1/secret/{namespace}/{secret} or /v1/secret/{namespace}/{secret}/{key}")
 
 
 def extract_bearer_token(header: str) -> Optional[str]:
@@ -654,16 +909,7 @@ def extract_bearer_token(header: str) -> Optional[str]:
 
 
 def expand_token_variants(token: str) -> Tuple[str, ...]:
-    """Return legacy token forms derived from a presented bearer value.
-
-    Used only when BRIDGE_TOKEN_LEGACY_VARIANTS is enabled. Forms:
-
-    1. Raw bearer value (after surrounding whitespace strip)
-    2. One layer of surrounding double or single quotes removed
-    3. One base64 decode (strict validate) of (1) or (2), UTF-8 decoded + strip
-
-    Strict mode does not use this helper; prefer exact BRIDGE_TOKEN equality.
-    """
+    """Return legacy token forms derived from a presented bearer value."""
     variants = []
     raw = token.strip()
     if raw:
@@ -689,19 +935,7 @@ def token_matches(
     *,
     legacy_variants: bool = False,
 ) -> bool:
-    """Return True when the presented bearer token authorizes the request.
-
-    Strict mode (default, legacy_variants=False):
-      - Accept only exact equality of presented token to configured BRIDGE_TOKEN.
-      - Reject quoted and base64-encoded presentations even if they decode to
-        the configured secret. This surfaces misconfigured secrets early.
-
-    Legacy expand mode (legacy_variants=True):
-      - Accept exact match without logging.
-      - Also accept forms from expand_token_variants(presented) that equal
-        configured BRIDGE_TOKEN, and emit a warning when a non-exact form
-        is what matched (so operators can fix encoding mistakes).
-    """
+    """Return True when the presented bearer token authorizes the request."""
     if presented is None or not configured:
         return False
     if presented == configured:
@@ -727,7 +961,6 @@ def build_config_from_env() -> BridgeConfig:
         raise RuntimeError("BRIDGE_TOKEN is required")
     return BridgeConfig(
         token=token,
-        # Default false: strict exact match. Opt into legacy quote/base64 expand.
         token_legacy_variants=parse_bool_env("BRIDGE_TOKEN_LEGACY_VARIANTS", False),
         backend_mode=os.getenv("BACKEND_MODE", "mock").strip(),
         item_name_template=os.getenv("ITEM_NAME_TEMPLATE", "{namespace}/{secret}").strip(),
@@ -739,9 +972,9 @@ def build_config_from_env() -> BridgeConfig:
         bw_password=os.getenv("BW_PASSWORD", "").strip(),
         bw_session=os.getenv("BW_SESSION", "").strip(),
         bw_path=os.getenv("BW_CLI_PATH", "bw").strip(),
-        # Optional hot-key cache; 0 (default) keeps every reconcile live.
         bw_item_cache_ttl_seconds=parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0),
         bw_command_timeout_seconds=parse_positive_int_env("BW_COMMAND_TIMEOUT_SECONDS", 120),
+        bw_negative_cache_ttl_seconds=parse_non_negative_int_env("BW_NEGATIVE_CACHE_TTL_SECONDS", 15),
     )
 
 
@@ -761,6 +994,7 @@ def build_backend(config: BridgeConfig) -> SecretBackend:
             bw_session=config.bw_session,
             cache_ttl_seconds=config.bw_item_cache_ttl_seconds,
             command_timeout_seconds=config.bw_command_timeout_seconds,
+            negative_cache_ttl_seconds=config.bw_negative_cache_ttl_seconds,
         )
     raise RuntimeError(f"Unsupported BACKEND_MODE: {config.backend_mode}")
 
@@ -773,13 +1007,19 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     backend: SecretBackend
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
-        # Keep stdout quiet; callers should inspect structured response codes.
         return
 
     def _write_json(self, status: int, payload: Dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _write_bytes(self, status: int, body: bytes, content_type: str = "application/octet-stream") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -802,90 +1042,130 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:  # noqa: N802
-        # Liveness: process is up. Keep this independent of session health so a
-        # dead bw session marks the pod NotReady without thrashing restarts.
-        if self.path == "/healthz":
-            self._write_json(HTTPStatus.OK, {"ok": True})
-            return
-
-        # Readiness: for bw-cli, fail when the session is invalid so Service
-        # endpoints drop the pod and ESO stops hammering a dead bridge.
-        if self.path in ("/readyz", "/ready"):
-            ready = self.backend.is_ready()
-            if ready:
-                self._write_json(HTTPStatus.OK, {"ok": True, "ready": True})
-            else:
-                self._write_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"ok": False, "ready": False, "error": "backend session not ready"},
-                )
-            return
-
-        if self.path == "/metrics":
-            self._write_text(
-                HTTPStatus.OK,
-                self.backend.metrics_text(),
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-            return
-
-        if not self._authorized():
-            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+        start_time = time.time()
+        status_code = HTTPStatus.OK
+        matched_path = "/v1/secret"
 
         try:
-            namespace, secret, key = parse_secret_path(self.path)
-            value = self.backend.get_value(namespace, secret, key)
-            self._write_json(HTTPStatus.OK, {"value": value})
-        except ValueError as exc:
-            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except AuthError as exc:
-            LOGGER.error(
-                "auth failure path=%s code=%s error=%s",
-                self.path,
-                exc.code,
-                exc.log_message(),
-            )
-            self._write_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": str(exc), "code": exc.code, "hint": exc.hint},
-            )
-        except InvalidJsonError as exc:
-            LOGGER.error(
-                "invalid bw JSON path=%s code=%s error=%s",
-                self.path,
-                exc.code,
-                exc.log_message(),
-            )
-            self._write_json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": str(exc), "code": exc.code, "hint": exc.hint},
-            )
-        except SecretLookupError as exc:
-            LOGGER.warning(
-                "secret lookup failed path=%s code=%s error=%s",
-                self.path,
-                exc.code,
-                exc.log_message(),
-            )
-            self._write_json(
-                HTTPStatus.NOT_FOUND,
-                {"error": str(exc), "code": exc.code, "hint": exc.hint},
-            )
-        except BwCliError as exc:
-            LOGGER.error(
-                "bw CLI failure path=%s code=%s error=%s",
-                self.path,
-                exc.code,
-                exc.log_message(),
-            )
-            self._write_json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": str(exc), "code": exc.code, "hint": exc.hint},
-            )
-        except Exception as exc:  # pragma: no cover
-            LOGGER.exception("bridge request failed path=%s", self.path)
-            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            if self.path == "/healthz":
+                matched_path = "/healthz"
+                self._write_json(HTTPStatus.OK, {"ok": True})
+                return
+
+            if self.path in ("/readyz", "/ready"):
+                matched_path = "/readyz"
+                ready = self.backend.is_ready()
+                if ready:
+                    self._write_json(HTTPStatus.OK, {"ok": True, "ready": True})
+                else:
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                    self._write_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"ok": False, "ready": False, "error": "backend session not ready"},
+                    )
+                return
+
+            if self.path == "/metrics":
+                matched_path = "/metrics"
+                self._write_text(
+                    HTTPStatus.OK,
+                    self.backend.metrics_text(),
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                return
+
+            if not self._authorized():
+                status_code = HTTPStatus.UNAUTHORIZED
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+
+            try:
+                namespace, secret, key = parse_secret_path(self.path)
+
+                if key is None:
+                    # Multi-key bulk JSON endpoint (Issue #19)
+                    values = self.backend.get_all_values(namespace, secret)
+                    self._write_json(HTTPStatus.OK, {"data": values, **values})
+                elif key.startswith("attachment/"):
+                    # Binary attachment endpoint (Issue #23)
+                    filename = key[len("attachment/") :]
+                    content_bytes, mime = self.backend.get_attachment(namespace, secret, filename)
+                    accept_header = self.headers.get("Accept", "").lower()
+                    if "application/octet-stream" in accept_header or "application/x-binary" in accept_header:
+                        self._write_bytes(HTTPStatus.OK, content_bytes, mime)
+                    else:
+                        b64_val = base64.b64encode(content_bytes).decode("utf-8")
+                        self._write_json(
+                            HTTPStatus.OK,
+                            {
+                                "value": b64_val,
+                                "filename": filename,
+                                "size": len(content_bytes),
+                            },
+                        )
+                else:
+                    # Single key lookup
+                    value = self.backend.get_value(namespace, secret, key)
+                    self._write_json(HTTPStatus.OK, {"value": value})
+            except ValueError as exc:
+                status_code = HTTPStatus.BAD_REQUEST
+                self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except AuthError as exc:
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                LOGGER.error(
+                    "auth failure path=%s code=%s error=%s",
+                    self.path,
+                    exc.code,
+                    exc.log_message(),
+                )
+                self._write_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": str(exc), "code": exc.code, "hint": exc.hint},
+                )
+            except InvalidJsonError as exc:
+                status_code = HTTPStatus.BAD_GATEWAY
+                LOGGER.error(
+                    "invalid bw JSON path=%s code=%s error=%s",
+                    self.path,
+                    exc.code,
+                    exc.log_message(),
+                )
+                self._write_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": str(exc), "code": exc.code, "hint": exc.hint},
+                )
+            except SecretLookupError as exc:
+                status_code = HTTPStatus.NOT_FOUND
+                LOGGER.warning(
+                    "secret lookup failed path=%s code=%s error=%s",
+                    self.path,
+                    exc.code,
+                    exc.log_message(),
+                )
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": str(exc), "code": exc.code, "hint": exc.hint},
+                )
+            except BwCliError as exc:
+                status_code = HTTPStatus.BAD_GATEWAY
+                LOGGER.error(
+                    "bw CLI failure path=%s code=%s error=%s",
+                    self.path,
+                    exc.code,
+                    exc.log_message(),
+                )
+                self._write_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": str(exc), "code": exc.code, "hint": exc.hint},
+                )
+            except Exception as exc:  # pragma: no cover
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                LOGGER.exception("bridge request failed path=%s", self.path)
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        finally:
+            duration = time.time() - start_time
+            if hasattr(self.backend, "metrics") and self.backend.metrics is not None:
+                self.backend.metrics.record_request(matched_path, int(status_code), duration)
 
 
 def run() -> None:
@@ -899,10 +1179,11 @@ def run() -> None:
     port = int(os.getenv("BRIDGE_PORT", "8080"))
     LOGGER.info(
         "starting vaultwarden bridge backend_mode=%s port=%s cache_ttl=%ss "
-        "cmd_timeout=%ss token_legacy_variants=%s",
+        "neg_cache_ttl=%ss cmd_timeout=%ss token_legacy_variants=%s",
         config.backend_mode,
         port,
         config.bw_item_cache_ttl_seconds,
+        config.bw_negative_cache_ttl_seconds,
         config.bw_command_timeout_seconds,
         config.token_legacy_variants,
     )

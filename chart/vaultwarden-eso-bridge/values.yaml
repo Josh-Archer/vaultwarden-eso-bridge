@@ -41,6 +41,10 @@ backend:
     # 0 = disabled (default). Short TTLs (e.g. 15–60) reduce bw CLI load under
     # ESO reconcile storms but can serve stale secret values until expiry.
     itemCacheTtlSeconds: 0
+    # Negative cache TTL for 404/not-found lookups (seconds).
+    # Default 15s prevents hammering Vaultwarden when ExternalSecrets request
+    # missing secrets during reconciliation loops. 0 disables negative caching.
+    negativeCacheTtlSeconds: 15
     commandTimeoutSeconds: 120
     startupProbe:
       enabled: true

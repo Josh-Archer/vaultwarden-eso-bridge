@@ -16,10 +16,14 @@ rotation.
 
 | ESO field | Bridge behavior |
 | --- | --- |
-| Webhook URL path `/v1/secret/{{ .remoteRef.key }}/{{ .remoteRef.property }}` | `GET /v1/secret/{namespace}/{secret}/{key}` |
+| Webhook URL path `/v1/secret/{{ .remoteRef.key }}/{{ .remoteRef.property }}` | `GET /v1/secret/{namespace}/{secret}/{key}` (Single-key lookup) |
+| Webhook URL path `/v1/secret/{{ .remoteRef.key }}` | `GET /v1/secret/{namespace}/{secret}` (Bulk multi-key JSON dictionary for `dataFrom.extract`) |
+| Webhook URL path `/v1/secret/{{ .remoteRef.key }}/attachment/{{ .remoteRef.property }}` | `GET /v1/secret/{namespace}/{secret}/attachment/{filename}` (Binary file attachment) |
 | `remoteRef.key` | `{namespace}/{secret}` item path (must match `backend.itemNameTemplate`) |
-| `remoteRef.property` | Field / custom field name resolved by the backend |
-| Success body | JSON `{"value":"<string>"}` via `result.jsonPath: "$.value"` |
+| `remoteRef.property` | Field / custom field / attachment name resolved by the backend |
+| Success body (Single) | JSON `{"value":"<string>"}` via `result.jsonPath: "$.value"` |
+| Success body (Bulk) | JSON `{"data":{"<key>":"<value>",...}}` and flat key-value pairs |
+| Success body (Attachment) | JSON `{"value":"<base64>", "filename":"...", "size":N}` or binary octet-stream |
 | Auth | `Authorization: Bearer <BRIDGE_TOKEN>` |
 
 Keep the bridge `ClusterIP`-only. Do not expose it on the public internet.

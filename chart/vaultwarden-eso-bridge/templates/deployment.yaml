@@ -53,6 +53,18 @@ spec:
             - name: TLS_KEY_PATH
               value: {{ .Values.tls.keyPath | default "/etc/tls/tls.key" | quote }}
           {{- end }}
+          {{- if and .Values.websocketSync .Values.websocketSync.enabled }}
+            - name: WEBSOCKET_SYNC_ENABLED
+              value: "true"
+          {{- if .Values.websocketSync.url }}
+            - name: VAULTWARDEN_WS_URL
+              value: {{ .Values.websocketSync.url | quote }}
+          {{- end }}
+            - name: WEBSOCKET_RECONNECT_INTERVAL_SECONDS
+              value: "{{ .Values.websocketSync.reconnectIntervalSeconds | default 5 }}"
+            - name: WEBSOCKET_SSL_VERIFY
+              value: "{{ .Values.websocketSync.sslVerify }}"
+          {{- end }}
             - name: BRIDGE_TOKEN_LEGACY_VARIANTS
               value: "{{ .Values.auth.legacyTokenVariants }}"
             - name: BACKEND_MODE

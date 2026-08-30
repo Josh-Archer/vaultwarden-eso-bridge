@@ -2,6 +2,7 @@ import importlib.util
 import os
 import pathlib
 import subprocess
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1649,5 +1650,116 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(h4.responses[-1]["status"], 200)
         with self.assertRaises(bridge.SecretLookupError):
             backend.get_all_values("media", "plex")
+
+    def test_websocket_client_framing_and_signalr(self):
+        """Test VaultwardenWebSocketClient RFC 6455 framing and SignalR message dispatch."""
+        import socket
+        import struct
+        import threading
+
+        # Bind an ephemeral local port
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        events_received = []
+        def _handle_event(target, args):
+            events_received.append((target, args))
+
+        def _mock_server():
+            conn, _ = srv.accept()
+            try:
+                # 1. Read HTTP handshake
+                req = b""
+                while b"\r\n\r\n" not in req:
+                    req += conn.recv(1024)
+
+                # 2. Send 101 Switching Protocols
+                resp = (
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+                )
+                conn.sendall(resp)
+
+                # 3. Read client's SignalR protocol handshake
+                # Unmask text frame
+                header = conn.recv(2)
+                mask = conn.recv(4)
+                payload_len = header[1] & 0x7F
+                masked_payload = conn.recv(payload_len)
+                # Client sent: {"protocol":"json","version":1}\x1e
+
+                # 4. Server sends SignalR notification: {"type":1,"target":"SyncVault","arguments":["user-42"]}\x1e
+                event_payload = b'{"type":1,"target":"SyncVault","arguments":["user-42"]}\x1e'
+                frame = bytearray()
+                frame.append(0x81)  # FIN + text
+                frame.append(len(event_payload))  # Unmasked server frame
+                frame.extend(event_payload)
+                conn.sendall(frame)
+
+                # Keep open briefly
+                time.sleep(0.1)
+            finally:
+                conn.close()
+                srv.close()
+
+        server_thread = threading.Thread(target=_mock_server, daemon=True)
+        server_thread.start()
+
+        metrics = bridge.AuthMetrics()
+        client = bridge.VaultwardenWebSocketClient(
+            server_url=f"ws://127.0.0.1:{port}/notifications/hub",
+            token="test-token",
+            on_notification=_handle_event,
+            reconnect_interval_seconds=1.0,
+            metrics=metrics,
+        )
+        client.start()
+
+        # Wait for notification to be received
+        for _ in range(50):
+            if events_received:
+                break
+            time.sleep(0.02)
+
+        client.stop()
+        self.assertTrue(len(events_received) >= 1)
+        self.assertEqual(events_received[0][0], "SyncVault")
+        self.assertEqual(events_received[0][1], ["user-42"])
+        self.assertEqual(metrics.websocket_notifications_total, 1)
+
+    def test_build_config_websocket_sync_enabled(self):
+        """Test build_config_from_env parses WebSocket sync parameters."""
+        env_vars = {
+            "BRIDGE_TOKEN": "test-token",
+            "WEBSOCKET_SYNC_ENABLED": "true",
+            "VAULTWARDEN_WS_URL": "wss://vault.archer.casa/notifications/hub",
+            "WEBSOCKET_TOKEN": "ws-bearer-token",
+            "WEBSOCKET_RECONNECT_INTERVAL_SECONDS": "8.5",
+            "WEBSOCKET_SSL_VERIFY": "false",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertTrue(config.websocket_sync_enabled)
+            self.assertEqual(config.websocket_url, "wss://vault.archer.casa/notifications/hub")
+            self.assertEqual(config.websocket_token, "ws-bearer-token")
+            self.assertEqual(config.websocket_reconnect_interval_seconds, 8.5)
+            self.assertFalse(config.websocket_ssl_verify)
+
+    def test_build_config_websocket_url_auto_derived(self):
+        """Test VAULTWARDEN_WS_URL is auto-derived from VAULTWARDEN_SERVER when not set."""
+        env_vars = {
+            "BRIDGE_TOKEN": "test-token",
+            "WEBSOCKET_SYNC_ENABLED": "true",
+            "VAULTWARDEN_WS_URL": "",
+            "VAULTWARDEN_SERVER": "https://vault.example.com",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertTrue(config.websocket_sync_enabled)
+            self.assertEqual(config.websocket_url, "wss://vault.example.com/notifications/hub")
 if __name__ == "__main__":
     unittest.main()

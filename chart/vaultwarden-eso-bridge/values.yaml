@@ -90,6 +90,13 @@ backend:
     commandTimeoutSeconds: 60
   mockSecrets: {}
 
+# -- Event-driven real-time secret sync over Vaultwarden WebSocket (/notifications/hub).
+websocketSync:
+  enabled: false
+  url: ""
+  reconnectIntervalSeconds: 5
+  sslVerify: true
+
 # Probe defaults. Liveness uses /healthz (process up). Readiness uses /readyz
 # which fails for bw-cli when the Bitwarden session is invalid so the pod is
 # removed from Service endpoints and ESO stops hammering a dead bridge.

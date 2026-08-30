@@ -101,6 +101,29 @@ spec:
             - name: BW_COMMAND_TIMEOUT_SECONDS
               value: "{{ .Values.backend.bwCli.commandTimeoutSeconds }}"
           {{- end }}
+          {{- if or (eq .Values.backend.mode "bws") .Values.backend.bws.enabled }}
+          {{- if .Values.backend.bws.existingSecret }}
+            - name: BWS_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.bws.existingSecret }}
+                  key: {{ .Values.backend.bws.accessTokenKey | default "BWS_ACCESS_TOKEN" }}
+          {{- end }}
+          {{- if .Values.backend.bws.serverUrl }}
+            - name: BWS_SERVER_URL
+              value: {{ .Values.backend.bws.serverUrl | quote }}
+          {{- end }}
+          {{- if .Values.backend.bws.projectId }}
+            - name: BWS_PROJECT_ID
+              value: {{ .Values.backend.bws.projectId | quote }}
+          {{- end }}
+            - name: BWS_ITEM_CACHE_TTL_SECONDS
+              value: "{{ .Values.backend.bws.itemCacheTtlSeconds | default 120 }}"
+            - name: BWS_NEGATIVE_CACHE_TTL_SECONDS
+              value: "{{ .Values.backend.bws.negativeCacheTtlSeconds | default 15 }}"
+            - name: BWS_COMMAND_TIMEOUT_SECONDS
+              value: "{{ .Values.backend.bws.commandTimeoutSeconds | default 60 }}"
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

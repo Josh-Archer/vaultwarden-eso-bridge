@@ -37,15 +37,20 @@ Prefer fixing the stored `BRIDGE_TOKEN` and client `Authorization` header so val
 Required at minimum:
 - `auth.existingSecret` with key `auth.tokenKey` containing `BRIDGE_TOKEN`
 - `backend.itemNameTemplate` (default `{namespace}/{secret}`)
-- `backend.mode` (`mock` or `bw-cli`)
+- `backend.mode` (`mock`, `bw-cli`, or `bws`)
 
-For `backend.mode=bw-cli`, set:
+For `backend.mode=bw-cli` (Vaultwarden Password Manager), set:
 - `backend.vaultwarden.server` (or secret key `BW_SERVER`)
 - `backend.bwCli.existingSecret` with:
   - `BW_EMAIL`
   - `BW_PASSWORD`
   - optional `BW_SESSION`
 
+For `backend.mode=bws` (Bitwarden Secrets Manager native machine account), set:
+- `backend.bws.existingSecret` with:
+  - `BWS_ACCESS_TOKEN` (machine access token; no user email, master password, or 2FA required)
+- optional `backend.bws.serverUrl` (defaults to `https://vault.bitwarden.com/api` or `https://vault.bitwarden.eu/api`)
+- optional `backend.bws.projectId` (to filter secret lookups to a specific project)
 Primary override points:
 - `service.*` for port/type/annotations
 - `exposure.allowExternalService` for explicit external exposure opt-in

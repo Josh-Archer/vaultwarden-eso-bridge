@@ -1358,5 +1358,163 @@ class BridgeUnitTests(unittest.TestCase):
             self.assertEqual(config.token, "")
             self.assertTrue(config.tokenreview_enabled)
 
+
+    def test_bws_backend_init_and_readiness(self):
+        """Test BwsBackend readiness with and without access token."""
+        backend_ready = bridge.BwsBackend(access_token="0.valid-token:secret")
+        self.assertTrue(backend_ready.is_ready())
+        self.assertIn("bridge_bw_session_ready 1", backend_ready.metrics_text())
+
+        backend_unready = bridge.BwsBackend(access_token="")
+        self.assertFalse(backend_unready.is_ready())
+        self.assertIn("bridge_bw_session_ready 0", backend_unready.metrics_text())
+
+    def test_bws_backend_get_value_and_bulk_json(self):
+        """Test BwsBackend secret lookup from JSON-encoded secret payload."""
+        fake_secrets = [
+            {
+                "id": "sec-1",
+                "key": "media/plex",
+                "value": '{"token": "my-plex-token", "claim": "claim-xyz"}',
+                "note": "sample note",
+            }
+        ]
+
+        calls = []
+        def _fake_http(method, endpoint, payload):
+            calls.append((method, endpoint))
+            if endpoint == "secrets":
+                return {"data": fake_secrets}
+            if endpoint == "secrets/sec-1":
+                return fake_secrets[0]
+            raise bridge.SecretLookupError(f"not found: {endpoint}")
+
+        backend = bridge.BwsBackend(
+            access_token="bws-token",
+            cache_ttl_seconds=60,
+            http_client=_fake_http,
+        )
+
+        # Single value lookup
+        val = backend.get_value("media", "plex", "token")
+        self.assertEqual(val, "my-plex-token")
+        self.assertEqual(backend.get_value("media", "plex", "claim"), "claim-xyz")
+        self.assertEqual(backend.get_value("media", "plex", "note"), "sample note")
+
+        # Bulk lookup
+        all_vals = backend.get_all_values("media", "plex")
+        self.assertEqual(all_vals["token"], "my-plex-token")
+        self.assertEqual(all_vals["claim"], "claim-xyz")
+        self.assertEqual(all_vals["note"], "sample note")
+
+        # Cache hit — no second API request
+        self.assertEqual(len(calls), 1)
+
+    def test_bws_backend_get_value_raw_string(self):
+        """Test BwsBackend lookup when secret value is a plain string."""
+        fake_secrets = [
+            {
+                "id": "sec-2",
+                "key": "default/db-pass",
+                "value": "super-secret-password",
+            }
+        ]
+
+        def _fake_http(method, endpoint, payload):
+            return fake_secrets
+
+        backend = bridge.BwsBackend(
+            access_token="bws-token",
+            http_client=_fake_http,
+        )
+
+        self.assertEqual(backend.get_value("default", "db-pass", "password"), "super-secret-password")
+        self.assertEqual(backend.get_value("default", "db-pass", "value"), "super-secret-password")
+        self.assertEqual(backend.get_value("default", "db-pass", "db-pass"), "super-secret-password")
+
+    def test_bws_backend_not_found_and_negative_cache(self):
+        """Test BwsBackend raises SecretLookupError for missing secrets and caches negative results."""
+        calls = []
+        def _fake_http(method, endpoint, payload):
+            calls.append(endpoint)
+            return []
+
+        backend = bridge.BwsBackend(
+            access_token="bws-token",
+            cache_ttl_seconds=60,
+            negative_cache_ttl_seconds=60,
+            http_client=_fake_http,
+        )
+
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_value("missing-ns", "missing-sec", "key")
+
+        # Second call should raise from negative cache without calling API again
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_value("missing-ns", "missing-sec", "key")
+
+        self.assertEqual(len(calls), 1)
+
+    def test_bws_backend_ensure_and_rotate_item(self):
+        """Test BwsBackend ensure_item (create/update) and rotate_item."""
+        store = {}
+
+        def _fake_http(method, endpoint, payload):
+            if method == "GET" and endpoint == "secrets":
+                return list(store.values())
+            if method == "POST" and endpoint == "secrets":
+                sec_id = f"id-{len(store)+1}"
+                item = {"id": sec_id, **payload}
+                store[sec_id] = item
+                return item
+            if method == "PUT" and endpoint.startswith("secrets/"):
+                sec_id = endpoint.split("/")[1]
+                store[sec_id].update(payload)
+                return store[sec_id]
+            raise bridge.SecretLookupError(f"not found: {endpoint}")
+
+        backend = bridge.BwsBackend(
+            access_token="bws-token",
+            cache_ttl_seconds=0,
+            http_client=_fake_http,
+        )
+
+        # 1. Ensure new secret
+        res1 = backend.ensure_item("media/radarr", {"api_key": "initial-key", "url": "http://radarr:7878"})
+        self.assertEqual(res1["status"], "created")
+        self.assertEqual(backend.get_value("media", "radarr", "api_key"), "initial-key")
+
+        # 2. Rotate secret field
+        res2 = backend.rotate_item("media/radarr", ["api_key"], length=24)
+        self.assertEqual(res2["rotated"], ["api_key"])
+        new_key = backend.get_value("media", "radarr", "api_key")
+        self.assertNotEqual(new_key, "initial-key")
+        self.assertEqual(len(new_key), 24)
+
+    def test_build_config_and_backend_bws_mode(self):
+        """Test build_config_from_env and build_backend for BWS mode."""
+        env_vars = {
+            "BRIDGE_TOKEN": "test-token",
+            "BACKEND_MODE": "bws",
+            "BWS_ACCESS_TOKEN": "0.test-token:secret",
+            "BWS_SERVER_URL": "https://vault.bitwarden.eu/api",
+            "BWS_PROJECT_ID": "proj-uuid-123",
+            "BWS_ITEM_CACHE_TTL_SECONDS": "90",
+            "BWS_NEGATIVE_CACHE_TTL_SECONDS": "20",
+            "BWS_COMMAND_TIMEOUT_SECONDS": "45",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertEqual(config.backend_mode, "bws")
+            self.assertEqual(config.bws_access_token, "0.test-token:secret")
+            self.assertEqual(config.bws_server_url, "https://vault.bitwarden.eu/api")
+            self.assertEqual(config.bws_project_id, "proj-uuid-123")
+            self.assertEqual(config.bws_item_cache_ttl_seconds, 90)
+            self.assertEqual(config.bws_negative_cache_ttl_seconds, 20)
+            self.assertEqual(config.bws_command_timeout_seconds, 45)
+
+            backend = bridge.build_backend(config)
+            self.assertIsInstance(backend, bridge.BwsBackend)
+            self.assertTrue(backend.is_ready())
 if __name__ == "__main__":
     unittest.main()

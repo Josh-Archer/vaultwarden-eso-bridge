@@ -75,3 +75,39 @@ networkPolicy:
   # Additional ingress peers. Each item may include namespaceSelector,
   # podSelector, and/or ipBlock.
   allowedPeers: []
+
+# -- Prometheus Operator ServiceMonitor. Requires the /metrics endpoint
+# exposed by bridge_server.py (added in Phase 1).
+serviceMonitor:
+  enabled: false
+  # Additional labels for ServiceMonitor discovery (e.g. release: kube-prometheus-stack).
+  labels: {}
+  annotations: {}
+  # Scrape interval. Prometheus Operator default is 30s.
+  interval: 30s
+  # scrapeTimeout: 10s
+  # metricRelabelings: []
+  # relabelings: []
+  # namespaceSelector: {}
+
+# -- Prometheus Operator PrometheusRule with default alerts.
+prometheusRule:
+  enabled: false
+  labels: {}
+  annotations: {}
+  # Fire VaultwardenBridgeSessionDown after this duration of bw-cli session failure.
+  sessionDownFor: 5m
+  sessionDownSeverity: critical
+  # Fire VaultwardenBridgeHighErrorRate when 5xx rate exceeds this fraction.
+  highErrorRateThreshold: 0.1
+  highErrorRateFor: 5m
+  highErrorRateSeverity: warning
+  # Additional custom rules appended to the group.
+  additionalRules: []
+
+# -- PodDisruptionBudget for rolling updates. Only useful when replicaCount > 1.
+podDisruptionBudget:
+  enabled: false
+  # Set one of minAvailable or maxUnavailable. maxUnavailable default: 1.
+  # minAvailable: 1
+  maxUnavailable: 1

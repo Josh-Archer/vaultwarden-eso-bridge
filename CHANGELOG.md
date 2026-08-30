@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.5.0...v0.6.0) (2026-08-30)
+
+
+### Features
+
+* **push:** support ESO PushSecret controller for bidirectional secret write-back ([#25](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/25)) ([#40](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/40)) ([46efaf1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/46efaf179e941e192dc69edea3c79ed7ee2020d6))
+* **sync:** Vaultwarden WebSocket listener for real-time secret updates ([#24](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/24)) ([#42](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/42)) ([da6a919](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/da6a9190ff97dcf164fae7c2e21c3409c0261707))
+
+
+### Bug Fixes
+
+* **docs:** sanitize BWS token examples and test fixtures ([#43](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/43)) ([9164d37](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/9164d379ca404c8bc5f13d9c87fbf1774070797e))
+
 ## [0.5.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.4.0...v0.5.0) (2026-08-30)
 
 

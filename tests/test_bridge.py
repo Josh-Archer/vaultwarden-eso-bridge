@@ -1516,5 +1516,138 @@ class BridgeUnitTests(unittest.TestCase):
             backend = bridge.build_backend(config)
             self.assertIsInstance(backend, bridge.BwsBackend)
             self.assertTrue(backend.is_ready())
+
+    def test_mock_backend_push_and_delete_operations(self):
+        """Test MockBackend set_value, set_all_values, and delete_secret."""
+        backend = bridge.MockBackend(secrets={})
+
+        # 1. Set single key
+        res1 = backend.set_value("media", "plex", "token", "val-123")
+        self.assertEqual(res1["status"], "updated")
+        self.assertEqual(backend.get_value("media", "plex", "token"), "val-123")
+
+        # 2. Set multiple keys
+        res2 = backend.set_all_values("media", "plex", {"client_id": "cid-456", "extra": "extra-val"})
+        self.assertEqual(res2["status"], "updated")
+        self.assertEqual(backend.get_value("media", "plex", "token"), "val-123")
+        self.assertEqual(backend.get_value("media", "plex", "client_id"), "cid-456")
+
+        # 3. Delete single key
+        del1 = backend.delete_secret("media", "plex", key="extra")
+        self.assertEqual(del1["status"], "deleted")
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_value("media", "plex", "extra")
+
+        # 4. Delete entire secret
+        del2 = backend.delete_secret("media", "plex")
+        self.assertEqual(del2["status"], "deleted")
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_all_values("media", "plex")
+
+    def test_bws_backend_push_and_delete_operations(self):
+        """Test BwsBackend set_value, set_all_values, and delete_secret."""
+        store = {}
+
+        def _fake_http(method, endpoint, payload):
+            if method == "GET" and endpoint == "secrets":
+                return list(store.values())
+            if method == "POST" and endpoint == "secrets":
+                sec_id = f"id-{len(store)+1}"
+                item = {"id": sec_id, **payload}
+                store[sec_id] = item
+                return item
+            if method == "PUT" and endpoint.startswith("secrets/"):
+                sec_id = endpoint.split("/")[1]
+                store[sec_id].update(payload)
+                return store[sec_id]
+            if method == "DELETE" and endpoint.startswith("secrets/"):
+                sec_id = endpoint.split("/")[1]
+                store.pop(sec_id, None)
+                return {}
+            raise bridge.SecretLookupError(f"not found: {endpoint}")
+
+        backend = bridge.BwsBackend(access_token="bws-token", cache_ttl_seconds=0, http_client=_fake_http)
+
+        # Set single key (creates item)
+        res1 = backend.set_value("infra", "db", "db_password_field", "sample-placeholder-value")
+        self.assertEqual(res1["status"], "created")
+        self.assertEqual(backend.get_value("infra", "db", "db_password_field"), "sample-placeholder-value")
+
+        # Set multiple keys (updates existing item)
+        res2 = backend.set_all_values("infra", "db", {"user": "postgres", "port": "5432"})
+        self.assertEqual(res2["status"], "updated")
+        self.assertEqual(backend.get_value("infra", "db", "db_password_field"), "sample-placeholder-value")
+        self.assertEqual(backend.get_value("infra", "db", "user"), "postgres")
+        # Delete single key
+        del1 = backend.delete_secret("infra", "db", key="port")
+        self.assertEqual(del1["status"], "deleted")
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_value("infra", "db", "port")
+
+        # Delete entire secret
+        del2 = backend.delete_secret("infra", "db")
+        self.assertEqual(del2["status"], "deleted")
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_all_values("infra", "db")
+
+    def test_handler_pushsecret_post_put_delete(self):
+        """Test HTTP handler do_POST, do_PUT, and do_DELETE for PushSecret endpoints."""
+        backend = bridge.MockBackend(secrets={})
+
+        class _PushTestHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, method="POST", body=b"", headers=None):
+                self.path = path
+                self.headers = headers or {"Authorization": "Bearer test-token"}
+                self._test_body = body
+                self.responses = []
+
+            def _read_body(self):
+                return self._test_body.decode("utf-8")
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                self.responses[-1]["body"] = b""
+
+            def _write_json(self, status, payload):
+                self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
+
+        bridge.BridgeRequestHandler.token = "test-token"
+        bridge.BridgeRequestHandler.token_review_authenticator = None
+        bridge.BridgeRequestHandler.token_legacy_variants = False
+        bridge.BridgeRequestHandler.backend = backend
+
+        import json as _json
+
+        # 1. POST single key push: /v1/secret/media/plex/token
+        h1 = _PushTestHandler("/v1/secret/media/plex/token", body=_json.dumps({"value": "p-token-1"}).encode())
+        h1.do_POST()
+        self.assertEqual(h1.responses[-1]["status"], 200)
+        self.assertEqual(backend.get_value("media", "plex", "token"), "p-token-1")
+
+        # 2. PUT bulk secret push: /v1/secret/media/plex
+        h2 = _PushTestHandler("/v1/secret/media/plex", method="PUT", body=_json.dumps({"client_id": "c-123", "pin": "9999"}).encode())
+        h2.do_PUT()
+        self.assertEqual(h2.responses[-1]["status"], 200)
+        self.assertEqual(backend.get_value("media", "plex", "token"), "p-token-1")
+        self.assertEqual(backend.get_value("media", "plex", "client_id"), "c-123")
+
+        # 3. DELETE property: /v1/secret/media/plex/pin
+        h3 = _PushTestHandler("/v1/secret/media/plex/pin", method="DELETE")
+        h3.do_DELETE()
+        self.assertEqual(h3.responses[-1]["status"], 200)
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_value("media", "plex", "pin")
+
+        # 4. DELETE entire secret: /v1/secret/media/plex
+        h4 = _PushTestHandler("/v1/secret/media/plex", method="DELETE")
+        h4.do_DELETE()
+        self.assertEqual(h4.responses[-1]["status"], 200)
+        with self.assertRaises(bridge.SecretLookupError):
+            backend.get_all_values("media", "plex")
 if __name__ == "__main__":
     unittest.main()

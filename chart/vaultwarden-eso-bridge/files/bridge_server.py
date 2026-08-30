@@ -650,12 +650,23 @@ class SecretBackend:
         """Verify item exists and populate missing fields. Returns action report."""
         raise NotImplementedError
 
+    def set_value(self, namespace: str, secret: str, key: str, value: str) -> Dict[str, Any]:
+        """Set a single key/value on a secret (PushSecret support)."""
+        raise NotImplementedError
+
+    def set_all_values(self, namespace: str, secret: str, values: Dict[str, str]) -> Dict[str, Any]:
+        """Set/merge dictionary of values on a secret (PushSecret bulk support)."""
+        raise NotImplementedError
+
+    def delete_secret(self, namespace: str, secret: str, key: Optional[str] = None) -> Dict[str, Any]:
+        """Delete a key or entire secret."""
+        raise NotImplementedError
+
     def rotate_item(
         self, item_name: str, field_names: List[str], length: int = 32
     ) -> Dict[str, Any]:
         """Rotate specified fields on an item with new random values. Returns action report."""
         raise NotImplementedError
-
     def is_ready(self) -> bool:
         """Return True when the backend can serve secret lookups."""
         return True
@@ -726,6 +737,30 @@ class MockBackend(SecretBackend):
             self.secrets[item_name][field] = generate_password(length)
             rotated.append(field)
         return {"item": item_name, "rotated": rotated}
+
+    def set_value(self, namespace: str, secret: str, key: str, value: str) -> Dict[str, Any]:
+        secret_path = f"{namespace}/{secret}"
+        if secret_path not in self.secrets:
+            self.secrets[secret_path] = {}
+        self.secrets[secret_path][key] = value
+        return {"item": secret_path, "key": key, "status": "updated"}
+
+    def set_all_values(self, namespace: str, secret: str, values: Dict[str, str]) -> Dict[str, Any]:
+        secret_path = f"{namespace}/{secret}"
+        if secret_path not in self.secrets:
+            self.secrets[secret_path] = {}
+        self.secrets[secret_path].update(values)
+        return {"item": secret_path, "keys": list(values.keys()), "status": "updated"}
+
+    def delete_secret(self, namespace: str, secret: str, key: Optional[str] = None) -> Dict[str, Any]:
+        secret_path = f"{namespace}/{secret}"
+        if secret_path not in self.secrets:
+            return {"item": secret_path, "status": "not_found"}
+        if key:
+            self.secrets[secret_path].pop(key, None)
+            return {"item": secret_path, "key": key, "status": "deleted"}
+        self.secrets.pop(secret_path, None)
+        return {"item": secret_path, "status": "deleted"}
 
 
 class BwCliBackend(SecretBackend):
@@ -1178,6 +1213,85 @@ class BwCliBackend(SecretBackend):
         )
         return {"item": item_name, "rotated": rotated}
 
+    def set_value(self, namespace: str, secret: str, key: str, value: str) -> Dict[str, Any]:
+        return self.set_all_values(namespace, secret, {key: value})
+
+    def set_all_values(self, namespace: str, secret: str, values: Dict[str, str]) -> Dict[str, Any]:
+        item_name = self.render_item_name(namespace, secret)
+        try:
+            item = self._get_item_data(namespace, secret)
+            fields = item.get("fields") or []
+            existing_field_names = set()
+            for f in fields:
+                fname = f.get("name")
+                if fname in values:
+                    f["value"] = values[fname]
+                    existing_field_names.add(fname)
+            for k, v in values.items():
+                if k not in existing_field_names:
+                    if k == "password" and "login" in item:
+                        item["login"]["password"] = v
+                    elif k == "username" and "login" in item:
+                        item["login"]["username"] = v
+                    else:
+                        fields.append({"name": k, "value": v, "type": 0})
+            item["fields"] = fields
+
+            raw_json = json.dumps(item)
+            encoded = self._encode_base64(raw_json)
+            self._run_bw_raw(["edit", "item", item["id"], encoded])
+            self._run_bw_raw(["sync"], tolerate_failure=True)
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("set_all_values item=%s updated keys=%s", item_name, list(values.keys()))
+            return {"item": item_name, "status": "updated", "keys": list(values.keys())}
+        except SecretLookupError:
+            folder_id = self._resolve_folder_id()
+            fields_list = [{"name": k, "value": v, "type": 0} for k, v in values.items() if k not in ("username", "password")]
+            new_item = {
+                "type": 1,
+                "name": item_name,
+                "notes": f"Managed by vaultwarden-eso-bridge ({namespace})",
+                "fields": fields_list,
+                "login": {
+                    "username": values.get("username", ""),
+                    "password": values.get("password", ""),
+                },
+            }
+            if folder_id:
+                new_item["folderId"] = folder_id
+            if self.org_id:
+                new_item["organizationId"] = self.org_id
+
+            raw_json = json.dumps(new_item)
+            encoded = self._encode_base64(raw_json)
+            self._run_bw_raw(["create", "item", encoded])
+            self._run_bw_raw(["sync"], tolerate_failure=True)
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("set_all_values item=%s created keys=%s", item_name, list(values.keys()))
+            return {"item": item_name, "status": "created", "keys": list(values.keys())}
+
+    def delete_secret(self, namespace: str, secret: str, key: Optional[str] = None) -> Dict[str, Any]:
+        item_name = self.render_item_name(namespace, secret)
+        try:
+            item = self._get_item_data(namespace, secret)
+            if key:
+                fields = [f for f in (item.get("fields") or []) if f.get("name") != key]
+                item["fields"] = fields
+                raw_json = json.dumps(item)
+                encoded = self._encode_base64(raw_json)
+                self._run_bw_raw(["edit", "item", item["id"], encoded])
+            else:
+                self._run_bw_raw(["delete", "item", item["id"]])
+            self._run_bw_raw(["sync"], tolerate_failure=True)
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("delete_secret item=%s key=%s deleted", item_name, key)
+            return {"item": item_name, "status": "deleted"}
+        except SecretLookupError:
+            return {"item": item_name, "status": "not_found"}
+
 
 
 class BwsBackend(SecretBackend):
@@ -1469,6 +1583,78 @@ class BwsBackend(SecretBackend):
         with self._cache_lock:
             self._item_cache.pop((namespace, secret), None)
         return {"item": item_name, "rotated": rotated}
+
+    def set_value(self, namespace: str, secret: str, key: str, value: str) -> Dict[str, Any]:
+        return self.set_all_values(namespace, secret, {key: value})
+
+    def set_all_values(self, namespace: str, secret: str, values: Dict[str, str]) -> Dict[str, Any]:
+        item_name = f"{namespace}/{secret}"
+        try:
+            existing = self._get_secret_data(namespace, secret)
+            secret_id = existing.get("_id")
+            current_dict = {k: v for k, v in existing.items() if not k.startswith("_")}
+            current_dict.update(values)
+            new_value = json.dumps(current_dict)
+            self._api_request(
+                "PUT",
+                f"secrets/{secret_id}",
+                {
+                    "projectId": existing.get("_projectId") or self.project_id or None,
+                    "key": existing.get("_key") or item_name,
+                    "value": new_value,
+                    "note": existing.get("note", ""),
+                },
+            )
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("bws set_all_values item=%s updated keys=%s", item_name, list(values.keys()))
+            return {"item": item_name, "status": "updated", "keys": list(values.keys())}
+        except SecretLookupError:
+            new_value = json.dumps(values)
+            resp = self._api_request(
+                "POST",
+                "secrets",
+                {
+                    "projectId": self.project_id or None,
+                    "key": item_name,
+                    "value": new_value,
+                    "note": f"Managed by vaultwarden-eso-bridge ({namespace})",
+                },
+            )
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("bws set_all_values item=%s created keys=%s", item_name, list(values.keys()))
+            return {"item": item_name, "status": "created", "id": resp.get("id") if isinstance(resp, dict) else None, "keys": list(values.keys())}
+
+    def delete_secret(self, namespace: str, secret: str, key: Optional[str] = None) -> Dict[str, Any]:
+        item_name = f"{namespace}/{secret}"
+        try:
+            existing = self._get_secret_data(namespace, secret)
+            secret_id = existing.get("_id")
+            if not secret_id:
+                return {"item": item_name, "status": "not_found"}
+            if key:
+                current_dict = {k: v for k, v in existing.items() if not k.startswith("_")}
+                current_dict.pop(key, None)
+                new_value = json.dumps(current_dict)
+                self._api_request(
+                    "PUT",
+                    f"secrets/{secret_id}",
+                    {
+                        "projectId": existing.get("_projectId") or self.project_id or None,
+                        "key": existing.get("_key") or item_name,
+                        "value": new_value,
+                        "note": existing.get("note", ""),
+                    },
+                )
+            else:
+                self._api_request("DELETE", f"secrets/{secret_id}")
+            with self._cache_lock:
+                self._item_cache.pop((namespace, secret), None)
+            LOGGER.info("bws delete_secret item=%s key=%s deleted", item_name, key)
+            return {"item": item_name, "status": "deleted"}
+        except SecretLookupError:
+            return {"item": item_name, "status": "not_found"}
 
 def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
     """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""
@@ -1852,8 +2038,32 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 status_code = HTTPStatus.BAD_REQUEST
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid JSON: {exc}"})
                 return
+            if self.path.startswith("/v1/secret/"):
+                matched_path = "/v1/secret"
+                namespace, secret, key = parse_secret_path(self.path)
+                if key:
+                    val_str = ""
+                    if isinstance(body, dict):
+                        val_str = str(body.get("value", body.get(key, body.get("data", ""))))
+                    elif isinstance(body, str):
+                        val_str = body
+                    else:
+                        val_str = str(body)
+                    result = self.backend.set_value(namespace, secret, key, val_str)
+                    LOGGER.info("push secret set_value item=%s/%s key=%s status=%s", namespace, secret, key, result.get("status"))
+                    self._write_json(HTTPStatus.OK, {"ok": True, "result": result})
+                else:
+                    if not isinstance(body, dict):
+                        status_code = HTTPStatus.BAD_REQUEST
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": "bulk secret push body must be a JSON object"})
+                        return
+                    values_dict = {str(k): str(v) if v is not None else "" for k, v in body.items()}
+                    result = self.backend.set_all_values(namespace, secret, values_dict)
+                    LOGGER.info("push secret set_all_values item=%s/%s keys=%s status=%s", namespace, secret, list(values_dict.keys()), result.get("status"))
+                    self._write_json(HTTPStatus.OK, {"ok": True, "result": result})
+                return
 
-            if self.path == "/v1/admin/ensure":
+            elif self.path == "/v1/admin/ensure":
                 matched_path = "/v1/admin/ensure"
                 items = body.get("items")
                 if not isinstance(items, list) or not items:
@@ -1906,8 +2116,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
             else:
                 status_code = HTTPStatus.NOT_FOUND
-                self._write_json(HTTPStatus.NOT_FOUND, {"error": f"unknown admin route: {self.path}"})
-
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": f"unknown route: {self.path}"})
         except AuthError as exc:
             status_code = HTTPStatus.SERVICE_UNAVAILABLE
             LOGGER.error("admin auth failure path=%s error=%s", self.path, exc.log_message())
@@ -1935,6 +2144,56 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if hasattr(self.backend, "metrics") and self.backend.metrics is not None:
                 self.backend.metrics.record_request(matched_path, int(status_code), duration)
 
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self.do_POST()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        start_time = time.time()
+        status_code = HTTPStatus.OK
+        matched_path = self.path
+
+        try:
+            if not self._authorized():
+                status_code = HTTPStatus.UNAUTHORIZED
+                self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+
+            if self.path.startswith("/v1/secret/"):
+                matched_path = "/v1/secret"
+                namespace, secret, key = parse_secret_path(self.path)
+                result = self.backend.delete_secret(namespace, secret, key)
+                LOGGER.info("push secret delete item=%s/%s key=%s status=%s", namespace, secret, key, result.get("status"))
+                self._write_json(HTTPStatus.OK, {"ok": True, "result": result})
+            else:
+                status_code = HTTPStatus.NOT_FOUND
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": f"unknown delete route: {self.path}"})
+        except AuthError as exc:
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            LOGGER.error("delete auth failure path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except SecretLookupError as exc:
+            status_code = HTTPStatus.NOT_FOUND
+            LOGGER.warning("delete lookup failed path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.NOT_FOUND, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except BridgeError as exc:
+            status_code = HTTPStatus.BAD_GATEWAY
+            LOGGER.error("delete failure path=%s error=%s", self.path, exc.log_message())
+            self._write_json(HTTPStatus.BAD_GATEWAY, {
+                "error": str(exc), "code": exc.code, "hint": exc.hint,
+            })
+        except Exception as exc:  # pragma: no cover
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            LOGGER.exception("delete request failed path=%s", self.path)
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        finally:
+            duration = time.time() - start_time
+            if hasattr(self.backend, "metrics") and self.backend.metrics is not None:
+                self.backend.metrics.record_request(matched_path, int(status_code), duration)
 
 def run() -> None:
     """Start the bridge server."""

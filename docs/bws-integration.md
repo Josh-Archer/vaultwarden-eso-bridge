@@ -21,7 +21,7 @@
 
 1. In the Bitwarden Secrets Manager web UI, navigate to **Machine Accounts** and create a new machine account (e.g. `eso-bridge-worker`).
 2. Grant access to the target projects containing your Kubernetes application secrets.
-3. Generate and copy the **Access Token** (`0.00000000-0000-0000-0000-000000000000:Base64Secret...`).
+3. Generate and copy the **Access Token** from the Bitwarden Secrets Manager UI.
 
 ---
 
@@ -37,7 +37,7 @@ metadata:
   namespace: external-secrets
 type: Opaque
 stringData:
-  BWS_ACCESS_TOKEN: "0.00000000-0000-0000-0000-000000000000:YourBwsMachineAccessTokenHere"
+  BWS_ACCESS_TOKEN: "<example-only-bws-machine-access-token>"
 ```
 
 ---

@@ -250,14 +250,20 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
         self.assertFalse(calls[0][1]["include_session"])
 
-    def _make_bw_backend(self, *, cache_ttl_seconds: int = 120, negative_cache_ttl_seconds: int = 15) -> "bridge.BwCliBackend":
+    def _make_bw_backend(
+        self,
+        *,
+        cache_ttl_seconds: int = 120,
+        negative_cache_ttl_seconds: int = 15,
+        item_template: str = "{namespace}/{secret}",
+    ) -> "bridge.BwCliBackend":
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
                 return bridge.BwCliBackend(
                     bw_path="bw",
                     folder_name="",
                     org_id="",
-                    item_template="{namespace}/{secret}",
+                    item_template=item_template,
                     bw_server="",
                     bw_email="",
                     bw_password="",
@@ -955,6 +961,19 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(h_att_bin.responses[0]["status"], 200)
         self.assertEqual(h_att_bin.responses[0]["body"], b"MOCK_CERT_BYTES")
         self.assertEqual(h_att_bin.responses[0]["headers"]["Content-Type"], "application/octet-stream")
+
+    def test_render_item_name(self):
+        backend = self._make_bw_backend()
+        self.assertEqual(backend.render_item_name("auth", "example"), "auth/example")
+
+        custom_backend = self._make_bw_backend(item_template="k8s-{namespace}-{secret}")
+        self.assertEqual(
+            custom_backend.render_item_name("auth", "example"),
+            "k8s-auth-example",
+        )
+
+        mock = bridge.MockBackend({"auth/example": {"KEY": "VAL"}})
+        self.assertEqual(mock.render_item_name("auth", "example"), "auth/example")
 
 
     def test_admin_ensure_creates_and_populates(self):

@@ -665,6 +665,10 @@ class SecretBackend:
     """Secret backend interface."""
 
     metrics: AuthMetrics
+    def render_item_name(self, namespace: str, secret: str) -> str:
+        """Render the Vaultwarden item name from namespace and secret."""
+        return f"{namespace}/{secret}"
+
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         raise NotImplementedError
@@ -723,6 +727,9 @@ class MockBackend(SecretBackend):
         self.secrets = secrets
         self.attachments = attachments or {}
         self.metrics = metrics or AuthMetrics()
+    def render_item_name(self, namespace: str, secret: str) -> str:
+        return f"{namespace}/{secret}"
+
 
     def get_value(self, namespace: str, secret: str, key: str) -> str:
         secret_path = f"{namespace}/{secret}"
@@ -822,6 +829,7 @@ class BwCliBackend(SecretBackend):
         self.bw_path = bw_path
         self.folder_name = folder_name
         self.org_id = org_id
+        self.item_name_template = item_template
         self.item_template = item_template
         self.bw_server = bw_server
         self.bw_email = bw_email
@@ -1084,8 +1092,12 @@ class BwCliBackend(SecretBackend):
                     self._item_cache[cache_key] = (time.time() + self.negative_cache_ttl_seconds, None, exc)
             raise
 
+    def render_item_name(self, namespace: str, secret: str) -> str:
+        """Render the Vaultwarden item name from namespace and secret."""
+        return self.item_name_template.format(namespace=namespace, secret=secret)
+
     def get_value(self, namespace: str, secret: str, key: str) -> str:
-        item_name = self.item_template.format(namespace=namespace, secret=secret)
+        item_name = self.render_item_name(namespace, secret)
         selected = self._get_item_cached(namespace, secret, item_name)
 
         value = extract_value_from_bw_item(selected, key)
@@ -1094,12 +1106,12 @@ class BwCliBackend(SecretBackend):
         return value
 
     def get_all_values(self, namespace: str, secret: str) -> Dict[str, str]:
-        item_name = self.item_template.format(namespace=namespace, secret=secret)
+        item_name = self.render_item_name(namespace, secret)
         selected = self._get_item_cached(namespace, secret, item_name)
         return extract_all_values_from_bw_item(selected)
 
     def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
-        item_name = self.item_template.format(namespace=namespace, secret=secret)
+        item_name = self.render_item_name(namespace, secret)
         selected = self._get_item_cached(namespace, secret, item_name)
 
         attachments = selected.get("attachments", []) or []

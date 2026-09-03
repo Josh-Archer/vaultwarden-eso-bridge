@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.0...v0.6.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **backend:** define render_item_name on BwCliBackend, MockBackend, and SecretBackend ([#44](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/44)) ([#45](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/45)) ([09c8943](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/09c8943850972017fb297f889d25d933c3278b5c))
+
 ## [0.6.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.5.0...v0.6.0) (2026-08-30)
 
 

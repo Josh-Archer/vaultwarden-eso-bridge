@@ -1813,5 +1813,261 @@ class BridgeUnitTests(unittest.TestCase):
             config = bridge.build_config_from_env()
             self.assertTrue(config.websocket_sync_enabled)
             self.assertEqual(config.websocket_url, "wss://vault.example.com/notifications/hub")
+
+    def test_annotation_is_true_and_password_length_clamp(self):
+        self.assertTrue(bridge.annotation_is_true("true"))
+        self.assertTrue(bridge.annotation_is_true("YES"))
+        self.assertTrue(bridge.annotation_is_true("1"))
+        self.assertFalse(bridge.annotation_is_true("false"))
+        self.assertFalse(bridge.annotation_is_true(None))
+        self.assertEqual(bridge.clamp_password_length("32"), 32)
+        self.assertEqual(bridge.clamp_password_length("2"), 8)
+        self.assertEqual(bridge.clamp_password_length("999"), 128)
+        self.assertEqual(bridge.clamp_password_length("nope"), 32)
+
+    def test_iter_externalsecret_remote_refs(self):
+        es = {
+            "spec": {
+                "data": [
+                    {"secretKey": "password", "remoteRef": {"key": "default/app", "property": "password"}},
+                    {"secretKey": "user", "remoteRef": {"key": "default/app", "property": "username"}},
+                ],
+                "dataFrom": [{"extract": {"key": "media/plex"}}],
+            }
+        }
+        refs = bridge.iter_externalsecret_remote_refs(es)
+        self.assertEqual(
+            refs,
+            [
+                ("default/app", "password"),
+                ("default/app", "username"),
+                ("media/plex", None),
+            ],
+        )
+
+    def test_autogenerate_decision_from_externalsecret_annotations(self):
+        es = {
+            "metadata": {
+                "annotations": {
+                    "vaultwarden.bridge/auto-generate": "true",
+                    "vaultwarden.bridge/password-length": "24",
+                }
+            },
+            "spec": {
+                "data": [
+                    {
+                        "secretKey": "password",
+                        "remoteRef": {"key": "default/demo", "property": "password"},
+                    }
+                ]
+            },
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        hit = provisioner.decision_for("default/demo", "password")
+        self.assertTrue(hit.enabled)
+        self.assertEqual(hit.password_length, 24)
+        self.assertEqual(hit.keys, ("password",))
+
+        miss_key = provisioner.decision_for("default/demo", "username")
+        self.assertFalse(miss_key.enabled)
+
+        miss_path = provisioner.decision_for("other/demo", "password")
+        self.assertFalse(miss_path.enabled)
+
+        disabled = bridge.ExternalSecretProvisioner(
+            enabled=False, list_externalsecrets=lambda: [es]
+        )
+        self.assertFalse(disabled.decision_for("default/demo", "password").enabled)
+
+    def test_autogenerate_decision_bulk_and_fail_closed_list(self):
+        es = {
+            "metadata": {
+                "annotations": {
+                    "vaultwarden.bridge/auto-generate": "true",
+                    "vaultwarden.bridge/generate-keys": "password,api_key",
+                }
+            },
+            "spec": {"dataFrom": [{"extract": {"key": "media/radarr"}}]},
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        bulk = provisioner.decision_for("media/radarr", None)
+        self.assertTrue(bulk.enabled)
+        self.assertEqual(bulk.keys, ("password", "api_key"))
+
+        broken = bridge.ExternalSecretProvisioner(
+            enabled=True,
+            list_externalsecrets=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        self.assertFalse(broken.decision_for("media/radarr", "password").enabled)
+
+    def _autogen_get_handler(self, backend, provisioner):
+        bridge.BridgeRequestHandler.token = "valid-token"
+        bridge.BridgeRequestHandler.backend = backend
+        bridge.BridgeRequestHandler.token_legacy_variants = False
+        bridge.BridgeRequestHandler.token_review_authenticator = None
+        bridge.BridgeRequestHandler.provisioner = provisioner
+        self.addCleanup(setattr, bridge.BridgeRequestHandler, "provisioner", None)
+
+        class _GetHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _write_json(self, status, payload):
+                self.responses.append({"status": status, "payload": payload})
+
+        return _GetHandler
+
+    def test_handler_autogenerate_creates_missing_secret_once(self):
+        backend = bridge.MockBackend(secrets={})
+        es = {
+            "metadata": {"annotations": {"vaultwarden.bridge/auto-generate": "true"}},
+            "spec": {
+                "data": [
+                    {
+                        "secretKey": "password",
+                        "remoteRef": {"key": "default/generated", "property": "password"},
+                    }
+                ]
+            },
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        handler_cls = self._autogen_get_handler(backend, provisioner)
+        first = handler_cls(
+            "/v1/secret/default/generated/password",
+            {"Authorization": "Bearer valid-token"},
+        )
+        first.do_GET()
+        self.assertEqual(first.responses[-1]["status"], 200)
+        created = first.responses[-1]["payload"]["value"]
+        self.assertEqual(len(created), 32)
+        self.assertEqual(backend.secrets["default/generated"]["password"], created)
+
+        second = handler_cls(
+            "/v1/secret/default/generated/password",
+            {"Authorization": "Bearer valid-token"},
+        )
+        second.do_GET()
+        self.assertEqual(second.responses[-1]["status"], 200)
+        self.assertEqual(second.responses[-1]["payload"]["value"], created)
+
+    def test_handler_autogenerate_does_not_overwrite_existing(self):
+        backend = bridge.MockBackend(secrets={"default/keep": {"password": "already-set"}})
+        es = {
+            "metadata": {"annotations": {"vaultwarden.bridge/auto-generate": "true"}},
+            "spec": {
+                "data": [
+                    {
+                        "secretKey": "password",
+                        "remoteRef": {"key": "default/keep", "property": "password"},
+                    }
+                ]
+            },
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        handler_cls = self._autogen_get_handler(backend, provisioner)
+        req = handler_cls(
+            "/v1/secret/default/keep/password",
+            {"Authorization": "Bearer valid-token"},
+        )
+        req.do_GET()
+        self.assertEqual(req.responses[-1]["status"], 200)
+        self.assertEqual(req.responses[-1]["payload"]["value"], "already-set")
+
+    def test_handler_autogenerate_absent_annotation_stays_404(self):
+        backend = bridge.MockBackend(secrets={})
+        es = {
+            "metadata": {"annotations": {}},
+            "spec": {
+                "data": [
+                    {
+                        "secretKey": "password",
+                        "remoteRef": {"key": "default/missing", "property": "password"},
+                    }
+                ]
+            },
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        handler_cls = self._autogen_get_handler(backend, provisioner)
+        req = handler_cls(
+            "/v1/secret/default/missing/password",
+            {"Authorization": "Bearer valid-token"},
+        )
+        req.do_GET()
+        self.assertEqual(req.responses[-1]["status"], 404)
+        self.assertNotIn("default/missing", backend.secrets)
+
+    def test_handler_autogenerate_respects_password_length(self):
+        backend = bridge.MockBackend(secrets={})
+        es = {
+            "metadata": {
+                "annotations": {
+                    "vaultwarden.bridge/auto-generate": "true",
+                    "vaultwarden.bridge/password-length": "48",
+                }
+            },
+            "spec": {
+                "data": [
+                    {
+                        "secretKey": "password",
+                        "remoteRef": {"key": "default/long", "property": "password"},
+                    }
+                ]
+            },
+        }
+        provisioner = bridge.ExternalSecretProvisioner(
+            enabled=True, list_externalsecrets=lambda: [es]
+        )
+        handler_cls = self._autogen_get_handler(backend, provisioner)
+        req = handler_cls(
+            "/v1/secret/default/long/password",
+            {"Authorization": "Bearer valid-token"},
+        )
+        req.do_GET()
+        self.assertEqual(req.responses[-1]["status"], 200)
+        self.assertEqual(len(req.responses[-1]["payload"]["value"]), 48)
+
+    def test_build_config_auto_generate_from_env(self):
+        env_vars = {
+            "BRIDGE_TOKEN": "test-token",
+            "AUTO_GENERATE_ENABLED": "true",
+            "AUTO_GENERATE_ANNOTATION": "custom.bridge/auto",
+            "AUTO_GENERATE_DEFAULT_PASSWORD_LENGTH": "40",
+            "AUTO_GENERATE_LIST_CACHE_TTL_SECONDS": "9",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            config = bridge.build_config_from_env()
+            self.assertTrue(config.auto_generate_enabled)
+            self.assertEqual(config.auto_generate_annotation, "custom.bridge/auto")
+            self.assertEqual(config.auto_generate_default_password_length, 40)
+            self.assertEqual(config.auto_generate_list_cache_ttl_seconds, 9)
+
+    def test_bw_cli_encode_base64_and_get_item_data(self):
+        backend = self._make_bw_backend()
+        encoded = backend._encode_base64('{"name":"x"}')
+        self.assertEqual(encoded, bridge.base64.b64encode(b'{"name":"x"}').decode("ascii"))
+        with patch.object(backend, "_get_item_cached", return_value={"id": "abc"}) as cached:
+            self.assertEqual(backend._get_item_data("ns", "sec"), {"id": "abc"})
+            cached.assert_called_once_with("ns", "sec", "ns/sec")
 if __name__ == "__main__":
     unittest.main()

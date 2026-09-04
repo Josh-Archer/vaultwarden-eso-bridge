@@ -246,6 +246,24 @@ To eliminate static shared `BRIDGE_TOKEN` secrets entirely:
 2. Deploy `examples/08-clustersecretstore-tokenreview.yaml`, which sets `serviceAccountRef` on ESO's webhook provider. ESO automatically projects its short-lived ServiceAccount token to the bridge, and the bridge validates caller identity via the Kubernetes TokenReview API.
 3. In-pod TLS termination can be enabled with `tls.enabled: true` and `tls.existingSecret: <secret-name>` to encrypt traffic end-to-end between ESO and the bridge.
 
+## Declarative auto-generation (ExternalSecret annotations)
+
+ESO webhook calls are GET-only and do not forward annotations. When
+`provisioning.autoGenerate.enabled=true`, the bridge lists `ExternalSecret`
+objects and creates a missing Vaultwarden item only when the matching object
+is annotated:
+
+| Annotation | Meaning |
+| --- | --- |
+| `vaultwarden.bridge/auto-generate: "true"` | Opt in for this ExternalSecret |
+| `vaultwarden.bridge/password-length: "32"` | Generated password length (8–128) |
+| `vaultwarden.bridge/generate-keys: "password,api_key"` | Keys to create on bulk GET / `dataFrom` |
+
+Existing fields are never overwritten. Enable chart RBAC so the bridge
+ServiceAccount can `get/list/watch` `externalsecrets`. Sample:
+[`examples/11-externalsecret-autogenerate.yaml`](../examples/11-externalsecret-autogenerate.yaml).
+
+
 ---
 
 ## File map
@@ -258,6 +276,7 @@ To eliminate static shared `BRIDGE_TOKEN` secrets entirely:
 | `examples/03-clustersecretstore.yaml` | Webhook `ClusterSecretStore` |
 | `examples/04-externalsecret.yaml` | Single-key `ExternalSecret` |
 | `examples/05-externalsecret-multi-key.yaml` | Multi-key sample |
+| `examples/11-externalsecret-autogenerate.yaml` | Auto-generate missing Vaultwarden items |
 | `examples/values-mock.yaml` | Chart values: mock + NetworkPolicy |
 | `examples/values-bw-cli.yaml` | Chart values: bw-cli + NetworkPolicy |
 

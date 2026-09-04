@@ -27,3 +27,35 @@ subjects:
     name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- $prov := .Values.provisioning | default dict }}
+{{- $auto := $prov.autoGenerate | default dict }}
+{{- if and .Values.rbac.create $auto.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-externalsecrets
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-externalsecrets
+  labels:
+    app.kubernetes.io/name: vaultwarden-eso-bridge
+    app.kubernetes.io/part-of: secrets-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}-externalsecrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -960,10 +960,19 @@ class BwCliBackend(SecretBackend):
         """Point bw-cli at the configured Vaultwarden server before auth."""
         if not self.bw_server:
             return
-        self._run_bw_raw(
-            ["config", "server", self.bw_server],
-            include_session=False,
-        )
+        try:
+            self._run_bw_raw(
+                ["config", "server", self.bw_server],
+                include_session=False,
+            )
+        except BridgeError as exc:
+            # If already logged in, bw-cli refuses to update the server URL with
+            # "Logout required before server config update." That is safe to ignore
+            # because the server was already configured at login.
+            if "logout required" in str(exc).lower():
+                LOGGER.debug("bw-cli server already configured (%s)", exc)
+                return
+            raise
 
     def _bootstrap_auth(self, *, record_metric: bool = False) -> None:
         try:
@@ -2544,19 +2553,25 @@ def run() -> None:
     BridgeRequestHandler.backend = backend
     ws_client = None
     if config.websocket_sync_enabled and config.websocket_url:
-        def _on_ws_notification(target: str, args: List[Any]) -> None:
-            backend.invalidate_cache()
+        ws_token = config.websocket_token or config.bw_session or config.bws_access_token
+        if not ws_token:
+            LOGGER.info(
+                "WebSocket sync is enabled but no token (WEBSOCKET_TOKEN, BW_SESSION, or BWS_ACCESS_TOKEN) "
+                "is available; skipping WebSocket listener"
+            )
+        else:
+            def _on_ws_notification(target: str, args: List[Any]) -> None:
+                backend.invalidate_cache()
 
-        ws_client = VaultwardenWebSocketClient(
-            server_url=config.websocket_url,
-            token=config.websocket_token or config.bw_session or config.bws_access_token,
-            on_notification=_on_ws_notification,
-            reconnect_interval_seconds=config.websocket_reconnect_interval_seconds,
-            ssl_verify=config.websocket_ssl_verify,
-            metrics=backend.metrics if hasattr(backend, "metrics") else None,
-        )
-        ws_client.start()
-
+            ws_client = VaultwardenWebSocketClient(
+                server_url=config.websocket_url,
+                token=ws_token,
+                on_notification=_on_ws_notification,
+                reconnect_interval_seconds=config.websocket_reconnect_interval_seconds,
+                ssl_verify=config.websocket_ssl_verify,
+                metrics=backend.metrics if hasattr(backend, "metrics") else None,
+            )
+            ws_client.start()
     server = ThreadingHTTPServer(("0.0.0.0", port), BridgeRequestHandler)
 
     if config.tls_enabled:

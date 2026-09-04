@@ -250,6 +250,39 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
         self.assertFalse(calls[0][1]["include_session"])
 
+
+    def test_bw_cli_backend_ignores_logout_required_during_server_config(self):
+        calls = []
+
+        def _fake_run_bw_raw(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["config", "server"]:
+                raise bridge.BwCliError("bw CLI failed: Logout required before server config update.")
+            if args[:2] == ["login", "user@example.com"]:
+                raise bridge.BwCliError("bw CLI failed: Already logged in.")
+            if args[0] == "unlock":
+                return "unlocked-session"
+            if args == ["sync"]:
+                return ""
+            raise AssertionError(f"unexpected bw args: {args}")
+
+        with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
+            with patch.object(bridge.BwCliBackend, "_run_bw_raw", side_effect=_fake_run_bw_raw):
+                backend = bridge.BwCliBackend(
+                    bw_path="bw",
+                    folder_name="",
+                    org_id="",
+                    item_template="{namespace}/{secret}",
+                    bw_server="https://vault.example.internal",
+                    bw_email="user@example.com",
+                    bw_password="password",
+                    bw_session="",
+                    cache_ttl_seconds=120,
+                    command_timeout_seconds=20,
+                )
+
+        self.assertEqual(backend.session, "unlocked-session")
+        self.assertEqual(calls[0][0], ["config", "server", "https://vault.example.internal"])
     def _make_bw_backend(
         self,
         *,

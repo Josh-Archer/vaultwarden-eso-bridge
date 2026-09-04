@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.2...v0.7.0) (2026-09-04)
+
+
+### Features
+
+* **provisioning:** auto-generate missing secrets from ExternalSecret annotations ([#49](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/49)) ([0e5b649](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/0e5b649a87b3da1434cbf6ff8a05801ea4d7da28)), closes [#22](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/22)
+
 ## [0.6.2](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.1...v0.6.2) (2026-09-04)
 
 

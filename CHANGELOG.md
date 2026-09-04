@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.1...v0.6.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **backend:** ignore logout required during server config and guard websocket startup ([#47](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/47)) ([13495a2](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/13495a21488a8bca208631563ff3409f2bffd374))
+
 ## [0.6.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.0...v0.6.1) (2026-09-01)
 
 

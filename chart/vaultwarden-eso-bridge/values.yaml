@@ -97,6 +97,17 @@ websocketSync:
   reconnectIntervalSeconds: 5
   sslVerify: true
 
+# -- Declarative auto-generation of missing Vaultwarden items from ExternalSecret
+# annotations. Off by default. Existing fields are never overwritten.
+provisioning:
+  autoGenerate:
+    enabled: false
+    annotation: vaultwarden.bridge/auto-generate
+    passwordLengthAnnotation: vaultwarden.bridge/password-length
+    generateKeysAnnotation: vaultwarden.bridge/generate-keys
+    defaultPasswordLength: 32
+    listCacheTtlSeconds: 15
+
 # Probe defaults. Liveness uses /healthz (process up). Readiness uses /readyz
 # which fails for bw-cli when the Bitwarden session is invalid so the pod is
 # removed from Service endpoints and ESO stops hammering a dead bridge.

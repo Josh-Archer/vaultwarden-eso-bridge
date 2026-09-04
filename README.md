@@ -78,6 +78,25 @@ rotations until the entry expires.
 **Tenant safety:** cache entries are keyed by Kubernetes `namespace` + `secret`
 name, so concurrent tenants never share a cache slot.
 
+## Declarative auto-generation
+
+When `provisioning.autoGenerate.enabled` is true, a GET for a missing item can
+create it in Vaultwarden instead of returning 404. The bridge lists
+`ExternalSecret` objects and only generates when the object that references
+that remote key is annotated `vaultwarden.bridge/auto-generate: "true"`.
+
+| Setting | Env | Default |
+| --- | --- | --- |
+| `provisioning.autoGenerate.enabled` | `AUTO_GENERATE_ENABLED` | `false` |
+| `provisioning.autoGenerate.annotation` | `AUTO_GENERATE_ANNOTATION` | `vaultwarden.bridge/auto-generate` |
+| `provisioning.autoGenerate.passwordLengthAnnotation` | `AUTO_GENERATE_PASSWORD_LENGTH_ANNOTATION` | `vaultwarden.bridge/password-length` |
+| `provisioning.autoGenerate.generateKeysAnnotation` | `AUTO_GENERATE_KEYS_ANNOTATION` | `vaultwarden.bridge/generate-keys` |
+| `provisioning.autoGenerate.defaultPasswordLength` | `AUTO_GENERATE_DEFAULT_PASSWORD_LENGTH` | `32` (clamped 8–128) |
+
+Idempotency: `ensure_item` fills **missing** fields only. A second reconcile
+returns the existing value. Generation is fail-closed if the Kubernetes API
+cannot list ExternalSecrets. Sample: [`examples/11-externalsecret-autogenerate.yaml`](examples/11-externalsecret-autogenerate.yaml).
+
 ## Health probes and metrics
 
 The bridge exposes three unauthenticated operational endpoints:

@@ -71,6 +71,22 @@ spec:
               value: "{{ .Values.backend.mode }}"
             - name: ITEM_NAME_TEMPLATE
               value: "{{ .Values.backend.itemNameTemplate }}"
+          {{- $prov := .Values.provisioning | default dict }}
+          {{- $auto := $prov.autoGenerate | default dict }}
+          {{- if $auto.enabled }}
+            - name: AUTO_GENERATE_ENABLED
+              value: "true"
+            - name: AUTO_GENERATE_ANNOTATION
+              value: {{ $auto.annotation | default "vaultwarden.bridge/auto-generate" | quote }}
+            - name: AUTO_GENERATE_PASSWORD_LENGTH_ANNOTATION
+              value: {{ $auto.passwordLengthAnnotation | default "vaultwarden.bridge/password-length" | quote }}
+            - name: AUTO_GENERATE_KEYS_ANNOTATION
+              value: {{ $auto.generateKeysAnnotation | default "vaultwarden.bridge/generate-keys" | quote }}
+            - name: AUTO_GENERATE_DEFAULT_PASSWORD_LENGTH
+              value: "{{ $auto.defaultPasswordLength | default 32 }}"
+            - name: AUTO_GENERATE_LIST_CACHE_TTL_SECONDS
+              value: "{{ $auto.listCacheTtlSeconds | default 15 }}"
+          {{- end }}
             - name: VAULTWARDEN_SERVER
               value: "{{ .Values.backend.vaultwarden.server }}"
             - name: VAULTWARDEN_ORGANIZATION_ID

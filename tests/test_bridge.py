@@ -655,6 +655,54 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(value, "admin")
         run_raw_mock.assert_called_once_with(["sync"], tolerate_failure=True)
 
+    def test_bw_cli_select_item_requires_exact_name_match(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        items = [
+            {"id": "fuzzy-1", "name": "media/plex-old"},
+            {"id": "exact", "name": "media/plex"},
+            {"id": "fuzzy-2", "name": "media/plex-backup"},
+        ]
+        selected = backend._select_item(items, "media/plex")
+        self.assertEqual(selected["id"], "exact")
+
+    def test_bw_cli_select_item_raises_on_search_miss(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        items = [
+            {"id": "fuzzy-1", "name": "media/plex-old", "login": {"password": "wrong"}},
+            {"id": "fuzzy-2", "name": "media/plex-backup"},
+        ]
+        with self.assertRaises(bridge.SecretLookupError) as ctx:
+            backend._select_item(items, "media/plex")
+        self.assertIn("media/plex", str(ctx.exception))
+
+    def test_bw_cli_select_item_requires_org_and_folder_match(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        backend.org_id = "org-1"
+        items = [
+            {"id": "wrong-org", "name": "media/plex", "organizationId": "org-other", "folderId": "folder-1"},
+            {"id": "wrong-folder", "name": "media/plex", "organizationId": "org-1", "folderId": "folder-other"},
+            {"id": "match", "name": "media/plex", "organizationId": "org-1", "folderId": "folder-1"},
+        ]
+        with patch.object(backend, "_resolve_folder_id", return_value="folder-1"):
+            selected = backend._select_item(items, "media/plex")
+        self.assertEqual(selected["id"], "match")
+
+        with patch.object(backend, "_resolve_folder_id", return_value="folder-1"):
+            with self.assertRaises(bridge.SecretLookupError):
+                backend._select_item(items[:2], "media/plex")
+
+    def test_bw_cli_lookup_does_not_return_fuzzy_search_hit(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        with patch.object(
+            backend,
+            "_run_bw_json",
+            return_value=[{"name": "media/plex-old", "login": {"password": "wrong-secret"}}],
+        ):
+            with patch.object(backend, "_run_bw_raw", return_value=""):
+                with self.assertRaises(bridge.SecretLookupError):
+                    backend.get_value("media", "plex", "password")
+
+
     def test_bw_cli_backend_reauths_on_invalid_json_stdout(self):
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):

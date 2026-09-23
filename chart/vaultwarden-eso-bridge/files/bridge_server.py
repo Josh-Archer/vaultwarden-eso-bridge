@@ -241,6 +241,32 @@ def extract_all_values_from_bw_item(item: Dict) -> Dict[str, str]:
     return data
 
 
+def decode_bws_attachment_value(value: Any) -> Tuple[bytes, str]:
+    """Decode a BWS secret field used as an attachment.
+
+    Canonical base64 (strict alphabet, padding or +/, round-trip) is treated
+    as binary. Plaintext, including alphanumeric strings the default
+    permissive decoder would accept (e.g. "password"), is returned as UTF-8.
+    """
+    text = value if isinstance(value, str) else str(value)
+    compact = "".join(text.split())
+    if not compact or len(compact) % 4 != 0:
+        return text.encode("utf-8"), "text/plain"
+    alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    if any(ch not in alphabet for ch in compact):
+        return text.encode("utf-8"), "text/plain"
+    if not (compact.endswith("=") or "+" in compact or "/" in compact):
+        return text.encode("utf-8"), "text/plain"
+    try:
+        decoded = base64.b64decode(compact, validate=True)
+    except Exception:
+        return text.encode("utf-8"), "text/plain"
+    recoded = base64.b64encode(decoded).decode("ascii")
+    if recoded != compact:
+        return text.encode("utf-8"), "text/plain"
+    return decoded, "application/octet-stream"
+
+
 def parse_bool_env(name: str, default: bool = False) -> bool:
     """Parse a boolean environment value with fallback."""
     raw = os.getenv(name, "").strip().lower()
@@ -1792,12 +1818,7 @@ class BwsBackend(SecretBackend):
     def get_attachment(self, namespace: str, secret: str, filename: str) -> Tuple[bytes, str]:
         data = self._get_secret_data(namespace, secret)
         if filename in data:
-            val = data[filename]
-            try:
-                decoded = base64.b64decode(val)
-                return decoded, "application/octet-stream"
-            except Exception:
-                return val.encode("utf-8"), "text/plain"
+            return decode_bws_attachment_value(data[filename])
         raise SecretLookupError(
             f"Attachment '{filename}' not found on secret '{namespace}/{secret}'",
             hint="Store attachment base64 encoded in secret field or note.",

@@ -1533,6 +1533,61 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertEqual(backend.get_value("default", "db-pass", "value"), "super-secret-password")
         self.assertEqual(backend.get_value("default", "db-pass", "db-pass"), "super-secret-password")
 
+    def test_decode_bws_attachment_value_keeps_plaintext(self):
+        content, mime = bridge.decode_bws_attachment_value("password")
+        self.assertEqual(content, b"password")
+        self.assertEqual(mime, "text/plain")
+
+        content, mime = bridge.decode_bws_attachment_value("hello world")
+        self.assertEqual(content, b"hello world")
+        self.assertEqual(mime, "text/plain")
+
+        pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+        content, mime = bridge.decode_bws_attachment_value(pem)
+        self.assertEqual(content, pem.encode("utf-8"))
+        self.assertEqual(mime, "text/plain")
+
+        encoded = bridge.base64.b64encode(b"\x00\x01\xffbinary").decode("ascii")
+        content, mime = bridge.decode_bws_attachment_value(encoded)
+        self.assertEqual(content, b"\x00\x01\xffbinary")
+        self.assertEqual(mime, "application/octet-stream")
+
+        content, mime = bridge.decode_bws_attachment_value("dGVz\ndA==")
+        self.assertEqual(content, b"test")
+        self.assertEqual(mime, "application/octet-stream")
+
+    def test_bws_backend_get_attachment_plaintext_not_decoded(self):
+        import json
+
+        fake_secrets = [
+            {
+                "id": "sec-att",
+                "key": "media/plex",
+                "value": json.dumps(
+                    {
+                        "password.txt": "password",
+                        "token.bin": bridge.base64.b64encode(b"\x00\x01\xff").decode("ascii"),
+                    }
+                ),
+            }
+        ]
+
+        def _fake_http(method, endpoint, payload):
+            return fake_secrets
+
+        backend = bridge.BwsBackend(
+            access_token="bws-token",
+            cache_ttl_seconds=0,
+            http_client=_fake_http,
+        )
+        content, mime = backend.get_attachment("media", "plex", "password.txt")
+        self.assertEqual(content, b"password")
+        self.assertEqual(mime, "text/plain")
+
+        content, mime = backend.get_attachment("media", "plex", "token.bin")
+        self.assertEqual(content, b"\x00\x01\xff")
+        self.assertEqual(mime, "application/octet-stream")
+
     def test_bws_backend_not_found_and_negative_cache(self):
         """Test BwsBackend raises SecretLookupError for missing secrets and caches negative results."""
         calls = []

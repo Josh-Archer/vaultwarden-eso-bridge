@@ -1564,6 +1564,12 @@ class BwCliBackend(SecretBackend):
             if key:
                 fields = [f for f in (item.get("fields") or []) if f.get("name") != key]
                 item["fields"] = fields
+                login = item.get("login")
+                if isinstance(login, dict):
+                    if key in ("password", "login.password"):
+                        login.pop("password", None)
+                    elif key in ("username", "login.username"):
+                        login.pop("username", None)
                 raw_json = json.dumps(item)
                 encoded = self._encode_base64(raw_json)
                 self._run_bw_raw(["edit", "item", item["id"], encoded])

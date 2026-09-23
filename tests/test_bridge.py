@@ -2117,5 +2117,77 @@ class BridgeUnitTests(unittest.TestCase):
         with patch.object(backend, "_get_item_cached", return_value={"id": "abc"}) as cached:
             self.assertEqual(backend._get_item_data("ns", "sec"), {"id": "abc"})
             cached.assert_called_once_with("ns", "sec", "ns/sec")
+
+    def test_bw_cli_delete_secret_clears_login_password_and_username(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+
+        def _edited_item(item, key):
+            captured = []
+
+            def _fake_raw(args, **kwargs):
+                captured.append(list(args))
+                return ""
+
+            with patch.object(backend, "_get_item_data", return_value=item):
+                with patch.object(backend, "_run_bw_raw", side_effect=_fake_raw):
+                    result = backend.delete_secret("media", "plex", key=key)
+            self.assertEqual(result["status"], "deleted")
+            edit = next(args for args in captured if args[:2] == ["edit", "item"])
+            import json
+            return json.loads(bridge.base64.b64decode(edit[3]))
+
+        password_payload = _edited_item(
+            {
+                "id": "item-1",
+                "name": "media/plex",
+                "login": {"username": "plexuser", "password": "sample-placeholder-value"},
+                "fields": [
+                    {"name": "password", "value": "field-placeholder-value"},
+                    {"name": "TOKEN", "value": "tok"},
+                ],
+            },
+            "password",
+        )
+        self.assertNotIn("password", password_payload.get("login") or {})
+        self.assertEqual(password_payload["login"]["username"], "plexuser")
+        self.assertEqual([field["name"] for field in password_payload["fields"]], ["TOKEN"])
+
+        username_payload = _edited_item(
+            {
+                "id": "item-1",
+                "name": "media/plex",
+                "login": {"username": "plexuser", "password": "sample-placeholder-value"},
+                "fields": [{"name": "TOKEN", "value": "tok"}],
+            },
+            "username",
+        )
+        self.assertNotIn("username", username_payload.get("login") or {})
+        self.assertEqual(username_payload["login"]["password"], "sample-placeholder-value")
+
+        alias_payload = _edited_item(
+            {
+                "id": "item-1",
+                "name": "media/plex",
+                "login": {"username": "plexuser", "password": "sample-placeholder-value"},
+                "fields": [],
+            },
+            "login.password",
+        )
+        self.assertNotIn("password", alias_payload.get("login") or {})
+        self.assertEqual(alias_payload["login"]["username"], "plexuser")
+
+        token_payload = _edited_item(
+            {
+                "id": "item-1",
+                "name": "media/plex",
+                "login": {"username": "plexuser", "password": "sample-placeholder-value"},
+                "fields": [{"name": "TOKEN", "value": "tok"}],
+            },
+            "TOKEN",
+        )
+        self.assertEqual(token_payload["login"]["username"], "plexuser")
+        self.assertEqual(token_payload["login"]["password"], "sample-placeholder-value")
+        self.assertEqual(token_payload["fields"], [])
+
 if __name__ == "__main__":
     unittest.main()

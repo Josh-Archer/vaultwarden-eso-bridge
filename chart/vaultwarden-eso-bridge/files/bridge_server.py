@@ -1274,7 +1274,7 @@ class BwCliBackend(SecretBackend):
             break
 
         if selected is None:
-            selected = items[0]
+            raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
         return selected
 
     def _lookup_item(self, item_name: str) -> Dict:

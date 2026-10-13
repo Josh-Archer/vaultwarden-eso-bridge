@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.7.0...v0.7.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **backend:** clear login username and password on secret delete ([#55](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/55)) ([#58](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/58)) ([363e7b0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/363e7b0a43f59cf2e699fd36679e9967c56b6085))
+* **backend:** do not decode plaintext BWS attachments as base64 ([#56](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/56)) ([#59](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/59)) ([b8066b8](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/b8066b8497deb48a921f8ac950bcc0cde60f3d5e))
+* **backend:** raise on secret lookup miss instead of first search hit ([#54](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/54)) ([#57](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/57)) ([7e8bbe3](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/7e8bbe3c8ee86949505b995508fb959a31d19975))
+
 ## [0.7.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.6.2...v0.7.0) (2026-09-04)
 
 

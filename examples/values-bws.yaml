@@ -12,7 +12,7 @@ auth:
   tokenReview:
     enabled: true
     allowedServiceAccounts:
-      - "system:serviceaccount:external-secrets:external-secrets"
+      - "system:serviceaccount:external-secrets:external-secrets=*"
     cacheTtlSeconds: 300
 
 serviceAccount:

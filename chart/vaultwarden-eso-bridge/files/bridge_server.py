@@ -17,6 +17,7 @@ for External Secrets Operator Webhook providers.
 from __future__ import annotations
 
 import base64
+import fnmatch
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -333,6 +334,60 @@ def load_mock_secrets(raw_json: str) -> Dict[str, Dict[str, str]]:
     return normalized
 
 
+def extract_sa_namespace(username: str) -> Optional[str]:
+    """Extract Kubernetes namespace from a ServiceAccount username or rule pattern."""
+    if not username:
+        return None
+    cleaned = username.strip()
+    if cleaned.startswith("system:serviceaccount:"):
+        remainder = cleaned[len("system:serviceaccount:") :]
+        parts = remainder.split(":", 1)
+        return parts[0] if parts[0] else None
+    if ":" in cleaned:
+        parts = cleaned.split(":", 1)
+        return parts[0] if parts[0] else None
+    if "/" in cleaned:
+        parts = cleaned.split("/", 1)
+        return parts[0] if parts[0] else None
+    return None
+
+
+def service_account_matches(pattern: str, username: str) -> bool:
+    """Check if a service account username matches an identity pattern."""
+    if not username or not pattern:
+        return False
+    if pattern == "*" or pattern == username:
+        return True
+    if username.startswith("system:serviceaccount:"):
+        sa_suffix = username[len("system:serviceaccount:") :]
+        if pattern in (sa_suffix, sa_suffix.replace(":", "/")):
+            return True
+        if pattern.endswith(":*"):
+            ns_prefix = pattern[:-2]
+            if sa_suffix.startswith(f"{ns_prefix}:") or username.startswith(f"{ns_prefix}:"):
+                return True
+        if pattern.endswith("/*"):
+            ns_prefix = pattern[:-2]
+            if sa_suffix.startswith(f"{ns_prefix}:"):
+                return True
+    return False
+
+
+class ServiceAccountRule:
+    """Rule specifying an allowed ServiceAccount pattern and permitted namespaces."""
+
+    def __init__(self, pattern: str, allowed_namespaces: List[str], explicit_namespaces: bool = False):
+        self.pattern = pattern
+        self.allowed_namespaces = allowed_namespaces
+        self.explicit_namespaces = explicit_namespaces
+
+    def __repr__(self) -> str:
+        return (
+            f"ServiceAccountRule(pattern={self.pattern!r}, "
+            f"allowed_namespaces={self.allowed_namespaces!r}, explicit={self.explicit_namespaces})"
+        )
+
+
 class TokenReviewAuthenticator:
     """Authenticates Kubernetes ServiceAccount tokens via the TokenReview API."""
 
@@ -340,6 +395,7 @@ class TokenReviewAuthenticator:
         self,
         allowed_service_accounts: List[str],
         *,
+        allowed_namespaces: Optional[Dict[str, List[str]]] = None,
         audiences: Optional[List[str]] = None,
         cache_ttl_seconds: int = 300,
         negative_cache_ttl_seconds: int = 10,
@@ -356,6 +412,27 @@ class TokenReviewAuthenticator:
         self.token_path = token_path or os.getenv("KUBERNETES_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
         self._lock = threading.Lock()
         self._cache: Dict[str, Tuple[float, bool, str]] = {}
+        self._last_user: Optional[str] = None
+
+        self._rules: List[ServiceAccountRule] = []
+        for raw_entry in self.allowed_service_accounts:
+            if "=" in raw_entry:
+                pat, ns_str = raw_entry.split("=", 1)
+                pat = pat.strip()
+                ns_list = [ns.strip() for ns in re.split(r"[,;| ]+", ns_str) if ns.strip()]
+                self._rules.append(ServiceAccountRule(pat, ns_list, explicit_namespaces=True))
+            else:
+                pat = raw_entry.strip()
+                if pat == "*":
+                    ns_list = ["*"]
+                else:
+                    default_ns = extract_sa_namespace(pat)
+                    ns_list = [default_ns] if default_ns else []
+                self._rules.append(ServiceAccountRule(pat, ns_list, explicit_namespaces=False))
+
+        if allowed_namespaces:
+            for pat, ns_list in allowed_namespaces.items():
+                self._rules.append(ServiceAccountRule(pat.strip(), list(ns_list), explicit_namespaces=True))
 
     def _get_sa_token(self) -> Optional[str]:
         if os.path.exists(self.token_path):
@@ -370,23 +447,24 @@ class TokenReviewAuthenticator:
         """Check if username matches any allowed service account rule."""
         if not username:
             return False
-        for pattern in self.allowed_service_accounts:
-            if pattern == "*":
-                return True
-            if pattern == username:
-                return True
-            if username.startswith("system:serviceaccount:"):
-                sa_suffix = username[len("system:serviceaccount:"):]
-                if pattern in (sa_suffix, sa_suffix.replace(":", "/")):
+        return any(service_account_matches(rule.pattern, username) for rule in self._rules)
+
+    def is_namespace_allowed(self, username: str, namespace: str) -> bool:
+        """Check if an authenticated service account is authorized to read namespace."""
+        if not username or not namespace:
+            return False
+        matching_rules = [rule for rule in self._rules if service_account_matches(rule.pattern, username)]
+        if not matching_rules:
+            return False
+        sa_ns = extract_sa_namespace(username)
+        for rule in matching_rules:
+            for allowed_ns in rule.allowed_namespaces:
+                if allowed_ns == "*" or allowed_ns == namespace:
                     return True
-                if pattern.endswith(":*"):
-                    ns_prefix = pattern[:-2]
-                    if sa_suffix.startswith(f"{ns_prefix}:") or username.startswith(f"{ns_prefix}:"):
-                        return True
-                if pattern.endswith("/*"):
-                    ns_prefix = pattern[:-2]
-                    if sa_suffix.startswith(f"{ns_prefix}:"):
-                        return True
+                if fnmatch.fnmatchcase(namespace, allowed_ns):
+                    return True
+            if not rule.explicit_namespaces and sa_ns and sa_ns == namespace:
+                return True
         return False
 
     def _review_token(self, token: str) -> Tuple[bool, str]:
@@ -430,15 +508,18 @@ class TokenReviewAuthenticator:
             LOGGER.error("Kubernetes TokenReview API request failed: %s", exc)
             return False, ""
 
-    def authenticate(self, token: Optional[str]) -> bool:
+    def get_authenticated_user(self, token: Optional[str]) -> Optional[str]:
+        """Authenticate token and return caller username if permitted by SA rules, else None."""
         if not token:
-            return False
+            return None
         now = time.time()
         if self.cache_ttl_seconds > 0 or self.negative_cache_ttl_seconds > 0:
             with self._lock:
                 cached = self._cache.get(token)
                 if cached and cached[0] > now:
-                    return cached[1]
+                    user = cached[2] if cached[1] else None
+                    self._last_user = user
+                    return user
 
         authenticated, username = self._review_token(token)
         allowed = authenticated and self.matches_service_account(username)
@@ -448,11 +529,22 @@ class TokenReviewAuthenticator:
             with self._lock:
                 self._cache[token] = (now + ttl, allowed, username)
 
+        user = username if allowed else None
+        self._last_user = user
         if allowed:
             LOGGER.debug("TokenReview authentication succeeded for user=%s", username)
         else:
             LOGGER.warning("TokenReview authentication rejected for user=%s (authenticated=%s)", username, authenticated)
-        return allowed
+        return user
+
+    def authenticate(self, token: Optional[str], namespace: Optional[str] = None) -> bool:
+        """Authenticate token and optionally verify access to a specific namespace."""
+        user = self.get_authenticated_user(token)
+        if not user:
+            return False
+        if namespace is not None:
+            return self.is_namespace_allowed(user, namespace)
+        return True
 
 DEFAULT_AUTO_GENERATE_ANNOTATION = "vaultwarden.bridge/auto-generate"
 DEFAULT_PASSWORD_LENGTH_ANNOTATION = "vaultwarden.bridge/password-length"
@@ -2430,6 +2522,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     backend: SecretBackend
     provisioner: Optional[ExternalSecretProvisioner] = None
     _autogen_lock = threading.Lock()
+    auth_type: str = ""
+    caller_sa: Optional[str] = None
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
@@ -2464,14 +2558,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length)
 
     def _authorized(self) -> bool:
+        self.auth_type = ""
+        self.caller_sa = None
         header = self.headers.get("Authorization", "")
         presented = extract_bearer_token(header)
         if not presented:
             return False
         if self.token and token_matches(self.token, presented, legacy_variants=self.token_legacy_variants):
+            self.auth_type = "token"
             return True
-        if self.token_review_authenticator and self.token_review_authenticator.authenticate(presented):
-            return True
+        if self.token_review_authenticator:
+            user = self.token_review_authenticator.get_authenticated_user(presented)
+            if user:
+                self.auth_type = "tokenreview"
+                self.caller_sa = user
+                return True
+            if self.token_review_authenticator.authenticate(presented):
+                self.auth_type = "tokenreview"
+                self.caller_sa = getattr(self.token_review_authenticator, "_last_user", None) or "authenticated_sa"
+                return True
         return False
 
     def _get_with_autogen(self, namespace: str, secret: str, key: Optional[str]):
@@ -2559,6 +2664,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
             try:
                 namespace, secret, key = parse_secret_path(self.path)
+
+                if self.auth_type == "tokenreview" and self.token_review_authenticator and self.caller_sa:
+                    if not self.token_review_authenticator.is_namespace_allowed(self.caller_sa, namespace):
+                        status_code = HTTPStatus.FORBIDDEN
+                        LOGGER.warning(
+                            "TokenReview access forbidden: user=%s not authorized to read namespace=%s path=%s",
+                            self.caller_sa,
+                            namespace,
+                            self.path,
+                        )
+                        self._write_json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "forbidden",
+                                "code": "forbidden",
+                                "hint": f"Service account '{self.caller_sa}' is not permitted to access namespace '{namespace}'",
+                            },
+                        )
+                        return
 
                 if key is not None and key.startswith("attachment/"):
                     filename = key[len("attachment/") :]
@@ -2668,6 +2792,24 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/secret/"):
                 matched_path = "/v1/secret"
                 namespace, secret, key = parse_secret_path(self.path)
+                if self.auth_type == "tokenreview" and self.token_review_authenticator and self.caller_sa:
+                    if not self.token_review_authenticator.is_namespace_allowed(self.caller_sa, namespace):
+                        status_code = HTTPStatus.FORBIDDEN
+                        LOGGER.warning(
+                            "TokenReview access forbidden: user=%s not authorized to write namespace=%s path=%s",
+                            self.caller_sa,
+                            namespace,
+                            self.path,
+                        )
+                        self._write_json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "forbidden",
+                                "code": "forbidden",
+                                "hint": f"Service account '{self.caller_sa}' is not permitted to access namespace '{namespace}'",
+                            },
+                        )
+                        return
                 if key:
                     val_str = ""
                     if isinstance(body, dict):
@@ -2690,56 +2832,76 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.OK, {"ok": True, "result": result})
                 return
 
-            elif self.path == "/v1/admin/ensure":
-                matched_path = "/v1/admin/ensure"
-                items = body.get("items")
-                if not isinstance(items, list) or not items:
-                    status_code = HTTPStatus.BAD_REQUEST
-                    self._write_json(HTTPStatus.BAD_REQUEST, {
-                        "error": "body must contain 'items' array",
-                        "example": {"items": [{"name": "ns/secret", "fields": {"key": "default"}}]},
-                    })
-                    return
-                results = []
-                for entry in items:
-                    name = entry.get("name", "")
-                    fields = entry.get("fields", {})
-                    if not name or not isinstance(fields, dict):
+            elif self.path in ("/v1/admin/ensure", "/v1/admin/rotate"):
+                if self.auth_type == "tokenreview" and self.token_review_authenticator and self.caller_sa:
+                    if not self.token_review_authenticator.is_namespace_allowed(self.caller_sa, "*"):
+                        status_code = HTTPStatus.FORBIDDEN
+                        LOGGER.warning(
+                            "TokenReview access forbidden: user=%s not authorized for admin endpoint %s",
+                            self.caller_sa,
+                            self.path,
+                        )
+                        self._write_json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "error": "forbidden",
+                                "code": "forbidden",
+                                "hint": "Admin operations require admin token or unrestricted service account permissions",
+                            },
+                        )
+                        return
+                if self.path == "/v1/admin/ensure":
+                    matched_path = "/v1/admin/ensure"
+                    items = body.get("items")
+                    if not isinstance(items, list) or not items:
                         status_code = HTTPStatus.BAD_REQUEST
                         self._write_json(HTTPStatus.BAD_REQUEST, {
-                            "error": f"each item needs 'name' (str) and 'fields' (object), got: {entry}",
+                            "error": "body must contain 'items' array",
+                            "example": {"items": [{"name": "ns/secret", "fields": {"key": "default"}}]},
                         })
                         return
-                    result = self.backend.ensure_item(name, fields)
-                    results.append(result)
-                LOGGER.info("admin ensure completed items=%d", len(results))
-                self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+                    results = []
+                    for entry in items:
+                        name = entry.get("name", "")
+                        fields = entry.get("fields", {})
+                        if not name or not isinstance(fields, dict):
+                            status_code = HTTPStatus.BAD_REQUEST
+                            self._write_json(HTTPStatus.BAD_REQUEST, {
+                                "error": f"each item needs 'name' (str) and 'fields' (object), got: {entry}",
+                            })
+                            return
+                        result = self.backend.ensure_item(name, fields)
+                        results.append(result)
+                    LOGGER.info("admin ensure completed items=%d", len(results))
+                    self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+                    return
 
-            elif self.path == "/v1/admin/rotate":
-                matched_path = "/v1/admin/rotate"
-                items = body.get("items")
-                pw_length = int(body.get("length", 32))
-                if not isinstance(items, list) or not items:
-                    status_code = HTTPStatus.BAD_REQUEST
-                    self._write_json(HTTPStatus.BAD_REQUEST, {
-                        "error": "body must contain 'items' array",
-                        "example": {"items": [{"name": "ns/secret", "fields": ["password"]}], "length": 32},
-                    })
-                    return
-                results = []
-                for entry in items:
-                    name = entry.get("name", "")
-                    field_names = entry.get("fields", [])
-                    if not name or not isinstance(field_names, list) or not field_names:
+                elif self.path == "/v1/admin/rotate":
+                    matched_path = "/v1/admin/rotate"
+                    items = body.get("items")
+                    pw_length = int(body.get("length", 32))
+                    if not isinstance(items, list) or not items:
                         status_code = HTTPStatus.BAD_REQUEST
                         self._write_json(HTTPStatus.BAD_REQUEST, {
-                            "error": f"each item needs 'name' (str) and 'fields' (list), got: {entry}",
+                            "error": "body must contain 'items' array",
+                            "example": {"items": [{"name": "ns/secret", "fields": ["password"]}], "length": 32},
                         })
                         return
-                    result = self.backend.rotate_item(name, field_names, pw_length)
-                    results.append(result)
-                LOGGER.info("admin rotate completed items=%d", len(results))
-                self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+                    results = []
+                    for entry in items:
+                        name = entry.get("name", "")
+                        field_names = entry.get("fields", [])
+                        if not name or not isinstance(field_names, list) or not field_names:
+                            status_code = HTTPStatus.BAD_REQUEST
+                            self._write_json(HTTPStatus.BAD_REQUEST, {
+                                "error": f"each item needs 'name' (str) and 'fields' (list), got: {entry}",
+                            })
+                            return
+                        result = self.backend.rotate_item(name, field_names, pw_length)
+                        results.append(result)
+                    LOGGER.info("admin rotate completed items=%d", len(results))
+                    self._write_json(HTTPStatus.OK, {"ok": True, "results": results})
+                    return
 
             else:
                 status_code = HTTPStatus.NOT_FOUND

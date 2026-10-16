@@ -1385,7 +1385,7 @@ class BridgeUnitTests(unittest.TestCase):
     def test_handler_tokenreview_authentication(self):
         """Test BridgeRequestHandler authenticating via TokenReview."""
         backend = bridge.MockBackend(secrets={"media/plex": {"token": "plex-pass"}})
-        auth = bridge.TokenReviewAuthenticator(["system:serviceaccount:external-secrets:external-secrets"])
+        auth = bridge.TokenReviewAuthenticator(["system:serviceaccount:external-secrets:external-secrets=media"])
 
         with patch.object(auth, "_review_token", return_value=(True, "system:serviceaccount:external-secrets:external-secrets")):
             handler = bridge.BridgeRequestHandler
@@ -1413,16 +1413,198 @@ class BridgeUnitTests(unittest.TestCase):
                     import json as _json
                     self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
 
-            # Valid TokenReview SA bearer token
+            # Valid TokenReview SA bearer token for permitted namespace
             h_valid = _TestHandler("/v1/secret/media/plex/token", {"Authorization": "Bearer sa-jwt-123"})
             h_valid.do_GET()
             self.assertEqual(h_valid.responses[-1]["status"], 200)
             self.assertEqual(h_valid.responses[-1]["payload"]["value"], "plex-pass")
 
+            # Valid TokenReview SA bearer token for forbidden namespace
+            h_forbidden = _TestHandler("/v1/secret/forbidden-ns/plex/token", {"Authorization": "Bearer sa-jwt-123"})
+            h_forbidden.do_GET()
+            self.assertEqual(h_forbidden.responses[-1]["status"], 403)
+            self.assertEqual(h_forbidden.responses[-1]["payload"]["error"], "forbidden")
+
             # Missing authorization header
             h_no_auth = _TestHandler("/v1/secret/media/plex/token", {})
             h_no_auth.do_GET()
             self.assertEqual(h_no_auth.responses[-1]["status"], 401)
+
+    def test_tokenreview_least_privilege_namespace_matching(self):
+        """Test least-privilege namespace matching rules."""
+        # 1. Bare rules restrict to caller's own namespace
+        auth = bridge.TokenReviewAuthenticator([
+            "system:serviceaccount:media:plex",
+            "frontend:*",
+            "backend:api",
+        ])
+        # Same-namespace access allowed
+        self.assertTrue(auth.is_namespace_allowed("system:serviceaccount:media:plex", "media"))
+        self.assertTrue(auth.is_namespace_allowed("system:serviceaccount:frontend:web", "frontend"))
+        self.assertTrue(auth.is_namespace_allowed("system:serviceaccount:backend:api", "backend"))
+        # Cross-namespace access denied
+        self.assertFalse(auth.is_namespace_allowed("system:serviceaccount:media:plex", "frontend"))
+        self.assertFalse(auth.is_namespace_allowed("system:serviceaccount:frontend:web", "backend"))
+        self.assertFalse(auth.is_namespace_allowed("system:serviceaccount:backend:api", "media"))
+
+        # 2. Explicit allowed namespaces with '='
+        auth_explicit = bridge.TokenReviewAuthenticator([
+            "system:serviceaccount:external-secrets:external-secrets=*",
+            "system:serviceaccount:monitoring:prometheus=monitoring;infra|cluster",
+            "system:serviceaccount:dev:runner=dev-*",
+        ])
+        # Wildcard namespace allows any
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:external-secrets:external-secrets", "media"))
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:external-secrets:external-secrets", "prod"))
+        # Multiple delimited namespaces
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:monitoring:prometheus", "monitoring"))
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:monitoring:prometheus", "infra"))
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:monitoring:prometheus", "cluster"))
+        self.assertFalse(auth_explicit.is_namespace_allowed("system:serviceaccount:monitoring:prometheus", "billing"))
+        # Glob pattern namespaces
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "dev-staging"))
+        self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "dev-test"))
+        self.assertFalse(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "prod"))
+
+        # 3. Global wildcard SA allows any namespace
+        auth_wildcard = bridge.TokenReviewAuthenticator(["*"])
+        self.assertTrue(auth_wildcard.is_namespace_allowed("system:serviceaccount:any:sa", "any-ns"))
+
+        # 4. Unknown/empty user or namespace
+        self.assertFalse(auth.is_namespace_allowed("", "media"))
+        self.assertFalse(auth.is_namespace_allowed("system:serviceaccount:unknown:sa", "unknown"))
+        self.assertFalse(auth.is_namespace_allowed("system:serviceaccount:media:plex", ""))
+
+    def test_tokenreview_authenticate_with_namespace(self):
+        """Test TokenReviewAuthenticator.authenticate with optional namespace parameter."""
+        auth = bridge.TokenReviewAuthenticator([
+            "system:serviceaccount:media:plex",
+            "system:serviceaccount:ops:runner=*",
+        ])
+        with patch.object(
+            auth,
+            "_review_token",
+            side_effect=lambda t: (True, "system:serviceaccount:media:plex")
+            if t == "media-token"
+            else (True, "system:serviceaccount:ops:runner")
+            if t == "ops-token"
+            else (False, ""),
+        ):
+            # Checking token validity only (namespace=None)
+            self.assertTrue(auth.authenticate("media-token"))
+            self.assertTrue(auth.authenticate("ops-token"))
+            self.assertFalse(auth.authenticate("invalid-token"))
+
+            # Checking token validity + allowed namespace
+            self.assertTrue(auth.authenticate("media-token", namespace="media"))
+            self.assertFalse(auth.authenticate("media-token", namespace="finance"))
+            self.assertTrue(auth.authenticate("ops-token", namespace="media"))
+            self.assertTrue(auth.authenticate("ops-token", namespace="finance"))
+
+    def test_handler_tokenreview_least_privilege_endpoints(self):
+        """Test BridgeRequestHandler endpoints enforce least-privilege on single, bulk, attachment, and push."""
+        backend = bridge.MockBackend(
+            secrets={
+                "media/plex": {"token": "plex-token"},
+                "finance/payroll": {"salary": "secret-salary"},
+            },
+            attachments={
+                "media/plex": {"cert.pem": b"CERT-DATA"},
+                "finance/payroll": {"report.pdf": b"PDF-DATA"},
+            },
+        )
+        auth = bridge.TokenReviewAuthenticator([
+            "system:serviceaccount:media:plex",
+        ])
+
+        with patch.object(auth, "_review_token", return_value=(True, "system:serviceaccount:media:plex")):
+            handler = bridge.BridgeRequestHandler
+            handler.token = ""
+            handler.token_review_authenticator = auth
+            handler.backend = backend
+            handler.token_legacy_variants = False
+
+            class _TestHandler(bridge.BridgeRequestHandler):
+                def __init__(self, path, headers=None, body=b""):
+                    self.path = path
+                    self.headers = headers or {}
+                    self._test_body = body
+                    self.responses = []
+
+                def _read_body(self):
+                    return self._test_body
+
+                def send_response(self, status):
+                    self.responses.append({"status": status, "headers": {}})
+
+                def send_header(self, key, value):
+                    self.responses[-1]["headers"][key] = value
+
+                def end_headers(self):
+                    self.responses[-1]["body"] = b""
+
+                def _write_json(self, status, payload):
+                    self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
+
+                def _write_bytes(self, status, body, content_type="application/octet-stream"):
+                    self.responses.append({"status": status, "bytes": body, "headers": {"Content-Type": content_type}})
+
+            auth_header = {"Authorization": "Bearer sa-media-jwt"}
+
+            # 1. Single-key lookup: allowed vs forbidden
+            h_single_ok = _TestHandler("/v1/secret/media/plex/token", auth_header)
+            h_single_ok.do_GET()
+            self.assertEqual(h_single_ok.responses[-1]["status"], 200)
+            self.assertEqual(h_single_ok.responses[-1]["payload"]["value"], "plex-token")
+
+            h_single_forbidden = _TestHandler("/v1/secret/finance/payroll/salary", auth_header)
+            h_single_forbidden.do_GET()
+            self.assertEqual(h_single_forbidden.responses[-1]["status"], 403)
+            self.assertEqual(h_single_forbidden.responses[-1]["payload"]["code"], "forbidden")
+
+            # 2. Bulk multi-key lookup: allowed vs forbidden
+            h_bulk_ok = _TestHandler("/v1/secret/media/plex", auth_header)
+            h_bulk_ok.do_GET()
+            self.assertEqual(h_bulk_ok.responses[-1]["status"], 200)
+
+            h_bulk_forbidden = _TestHandler("/v1/secret/finance/payroll", auth_header)
+            h_bulk_forbidden.do_GET()
+            self.assertEqual(h_bulk_forbidden.responses[-1]["status"], 403)
+
+            # 3. Attachment lookup: allowed vs forbidden
+            h_att_ok = _TestHandler("/v1/secret/media/plex/attachment/cert.pem", auth_header)
+            h_att_ok.do_GET()
+            self.assertEqual(h_att_ok.responses[-1]["status"], 200)
+
+            h_att_forbidden = _TestHandler("/v1/secret/finance/payroll/attachment/report.pdf", auth_header)
+            h_att_forbidden.do_GET()
+            self.assertEqual(h_att_forbidden.responses[-1]["status"], 403)
+
+            # 4. PushSecret single/bulk: allowed vs forbidden
+            import json as _json
+            push_body = _json.dumps({"value": "new-val"}).encode()
+            h_push_ok = _TestHandler("/v1/secret/media/plex/token", auth_header, push_body)
+            h_push_ok.do_POST()
+            self.assertEqual(h_push_ok.responses[-1]["status"], 200)
+
+            h_push_forbidden = _TestHandler("/v1/secret/finance/payroll/salary", auth_header, push_body)
+            h_push_forbidden.do_POST()
+            self.assertEqual(h_push_forbidden.responses[-1]["status"], 403)
+
+            # 5. Admin operations blocked for restricted SA
+            ensure_body = _json.dumps({"items": [{"name": "media/new", "fields": {"k": "v"}}]}).encode()
+            h_admin = _TestHandler("/v1/admin/ensure", auth_header, ensure_body)
+            h_admin.do_POST()
+            self.assertEqual(h_admin.responses[-1]["status"], 403)
+
+            # 6. Cached token preserves caller identity and still enforces least privilege
+            h_cached_ok = _TestHandler("/v1/secret/media/plex/token", auth_header)
+            h_cached_ok.do_GET()
+            self.assertEqual(h_cached_ok.responses[-1]["status"], 200)
+
+            h_cached_forbidden = _TestHandler("/v1/secret/finance/payroll/salary", auth_header)
+            h_cached_forbidden.do_GET()
+            self.assertEqual(h_cached_forbidden.responses[-1]["status"], 403)
 
     def test_build_config_tokenreview_and_tls(self):
         """Test build_config_from_env parsing TokenReview and TLS flags."""

@@ -2288,7 +2288,7 @@ class BridgeUnitTests(unittest.TestCase):
             self.assertIn("caller=system:serviceaccount:media:plex", log_entry)
             self.assertIn("service_account=plex", log_entry)
             self.assertIn("caller_namespace=media", log_entry)
-            self.assertIn("namespace=media", log_entry)
+            self.assertEqual(log_entry.count("namespace="), 1)
             self.assertIn("item=media/plex", log_entry)
             self.assertIn("key=token", log_entry)
 
@@ -2338,7 +2338,7 @@ class BridgeUnitTests(unittest.TestCase):
             self.assertIn("caller=system:serviceaccount:billing:invoice-bot", log_entry)
             self.assertIn("service_account=invoice-bot", log_entry)
             self.assertIn("caller_namespace=billing", log_entry)
-            self.assertIn("namespace=billing", log_entry)
+            self.assertEqual(log_entry.count("namespace="), 1)
             self.assertIn("item=billing/invoice", log_entry)
             self.assertIn("keys=", log_entry)
 
@@ -2395,7 +2395,7 @@ class BridgeUnitTests(unittest.TestCase):
             self.assertIn("caller=system:serviceaccount:infra:cert-manager", log_entry)
             self.assertIn("service_account=cert-manager", log_entry)
             self.assertIn("caller_namespace=infra", log_entry)
-            self.assertIn("namespace=infra", log_entry)
+            self.assertEqual(log_entry.count("namespace="), 1)
             self.assertIn("item=infra/tls", log_entry)
             self.assertIn("filename=cert.key", log_entry)
             self.assertNotIn("SUPER-SECRET-PRIVATE-KEY-PEM", log_entry)
@@ -2414,7 +2414,8 @@ class BridgeUnitTests(unittest.TestCase):
 
     def test_audit_log_token_authenticated_caller(self):
         """Test logging successful secret read when caller authenticates via static token."""
-        backend = bridge.MockBackend(secrets={"monitoring/grafana": {"admin_password": "sensitive-grafana-pw"}})
+        fake_secret_val = "fake-test-value-not-a-secret"
+        backend = bridge.MockBackend(secrets={"monitoring/grafana": {"admin_password": fake_secret_val}})
 
         handler = bridge.BridgeRequestHandler
         handler.token = "my-static-bridge-token"
@@ -2452,24 +2453,24 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertIn("caller=token", log_entry)
         self.assertIn("service_account=token", log_entry)
         self.assertIn("caller_namespace=-", log_entry)
-        self.assertIn("namespace=monitoring", log_entry)
+        self.assertEqual(log_entry.count("namespace="), 1)
         self.assertIn("item=monitoring/grafana", log_entry)
         self.assertIn("key=admin_password", log_entry)
-        self.assertNotIn("sensitive-grafana-pw", log_entry)
+        self.assertNotIn(fake_secret_val, log_entry)
 
     def test_secret_value_never_appears_in_logs(self):
         """Test that secret values under all read operations never appear in log records."""
-        sensitive_single_value = "CRITICAL_SECRET_VALUE_SINGLE_KEY_987654321"
-        sensitive_bulk_val1 = "CRITICAL_BULK_SECRET_VAL_ALPHA_111111"
-        sensitive_bulk_val2 = "CRITICAL_BULK_SECRET_VAL_BETA_222222"
-        sensitive_att_content = b"CRITICAL_ATTACHMENT_PRIVATE_DATA_333333"
+        sensitive_single_value = "fake-test-value-not-a-secret-single-key"
+        sensitive_bulk_val1 = "fake-test-value-not-a-secret-bulk-val1"
+        sensitive_bulk_val2 = "fake-test-value-not-a-secret-bulk-val2"
+        sensitive_att_content = b"fake-test-value-not-a-secret-attachment-content"
         sensitive_att_b64 = bridge.base64.b64encode(sensitive_att_content).decode("utf-8")
 
         backend = bridge.MockBackend(
             secrets={
                 "prod/app": {"api_key": sensitive_single_value},
                 "prod/database": {
-                    "username": "dbuser",
+                    "username": "fake-test-user-not-a-secret",
                     "password": sensitive_bulk_val1,
                     "conn_string": sensitive_bulk_val2,
                 },
@@ -2595,6 +2596,94 @@ class BridgeUnitTests(unittest.TestCase):
         # Confirm no "secret read succeeded" is ever logged for failed requests
         for log_line in captured.output:
             self.assertNotIn("secret read succeeded", log_line)
+
+    def test_audit_log_authenticated_sa_fallback_resolves_real_caller(self):
+        """Test that audit log resolves the real service account even if caller_sa is preset to literal 'authenticated_sa'."""
+        backend = bridge.MockBackend(secrets={"monitoring/grafana": {"token": "fake-test-value-not-a-secret"}})
+        auth = bridge.TokenReviewAuthenticator(["system:serviceaccount:monitoring:prometheus"])
+
+        with patch.object(auth, "_review_token", return_value=(True, "system:serviceaccount:monitoring:prometheus")):
+            handler = bridge.BridgeRequestHandler
+            handler.token = ""
+            handler.token_review_authenticator = auth
+            handler.backend = backend
+            handler.token_legacy_variants = False
+
+            class _TestHandler(bridge.BridgeRequestHandler):
+                def __init__(self, path, headers=None):
+                    self.path = path
+                    self.headers = headers or {}
+                    self.caller_sa = "authenticated_sa"
+                    self.responses = []
+
+                def send_response(self, status):
+                    self.responses.append({"status": status, "headers": {}})
+
+                def send_header(self, key, value):
+                    self.responses[-1]["headers"][key] = value
+
+                def end_headers(self):
+                    self.responses[-1]["body"] = b""
+
+                def _write_json(self, status, payload):
+                    self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
+
+            h = _TestHandler("/v1/secret/monitoring/grafana/token", {"Authorization": "Bearer sa-prom-token"})
+            with self.assertLogs(bridge.LOGGER, level="INFO") as captured:
+                h.do_GET()
+
+            self.assertEqual(h.responses[-1]["status"], 200)
+            success_logs = [line for line in captured.output if "secret read succeeded" in line]
+            self.assertEqual(len(success_logs), 1)
+            log_entry = success_logs[0]
+
+            self.assertIn("caller=system:serviceaccount:monitoring:prometheus", log_entry)
+            self.assertIn("service_account=prometheus", log_entry)
+            self.assertIn("caller_namespace=monitoring", log_entry)
+            self.assertNotIn("authenticated_sa", log_entry)
+            self.assertEqual(log_entry.count("namespace="), 1)
+
+    def test_audit_log_namespace_logged_only_once_per_entry(self):
+        """Test that namespace is logged only once in item=ns/secret and never duplicated as namespace=ns."""
+        backend = bridge.MockBackend(secrets={"ns1/mysec": {"mykey": "fake-test-value-not-a-secret"}})
+
+        handler = bridge.BridgeRequestHandler
+        handler.token = "my-token"
+        handler.token_review_authenticator = None
+        handler.backend = backend
+        handler.token_legacy_variants = False
+
+        class _TestHandler(bridge.BridgeRequestHandler):
+            def __init__(self, path, headers=None):
+                self.path = path
+                self.headers = headers or {}
+                self.responses = []
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                self.responses[-1]["body"] = b""
+
+            def _write_json(self, status, payload):
+                self.responses.append({"status": status, "payload": payload, "headers": {"Content-Type": "application/json"}})
+
+        h = _TestHandler("/v1/secret/ns1/mysec/mykey", {"Authorization": "Bearer my-token"})
+        with self.assertLogs(bridge.LOGGER, level="INFO") as captured:
+            h.do_GET()
+
+        self.assertEqual(h.responses[-1]["status"], 200)
+        success_logs = [line for line in captured.output if "secret read succeeded" in line]
+        self.assertEqual(len(success_logs), 1)
+        log_entry = success_logs[0]
+
+        # The item path contains ns1, but there is no separate namespace=ns1 entry
+        self.assertIn("item=ns1/mysec", log_entry)
+        self.assertNotIn("namespace=ns1", log_entry)
+        self.assertEqual(log_entry.count("namespace="), 1)  # only caller_namespace=-
 
 if __name__ == "__main__":
     unittest.main()

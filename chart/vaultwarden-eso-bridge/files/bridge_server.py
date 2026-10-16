@@ -2479,18 +2479,31 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _get_caller_identity(self) -> Tuple[str, str, Optional[str]]:
         """Return (caller, service_account, caller_namespace)."""
         caller_sa = getattr(self, "caller_sa", None)
-        if not caller_sa:
+        if not caller_sa or caller_sa == "authenticated_sa":
             header = self.headers.get("Authorization", "")
             presented = extract_bearer_token(header)
             if self.token_review_authenticator and presented:
-                user = getattr(self.token_review_authenticator, "_last_user", None)
+                user = None
+                if hasattr(self.token_review_authenticator, "get_authenticated_user"):
+                    user = self.token_review_authenticator.get_authenticated_user(presented)
+                if not user:
+                    user = getattr(self.token_review_authenticator, "_last_user", None)
                 if not user:
                     with getattr(self.token_review_authenticator, "_lock", threading.Lock()):
                         cached = getattr(self.token_review_authenticator, "_cache", {}).get(presented)
-                        if cached and len(cached) >= 3 and cached[1]:
+                        if cached and len(cached) >= 3 and cached[1] and cached[2]:
                             user = cached[2]
-                caller_sa = user
-        if not caller_sa:
+                if not user and hasattr(self.token_review_authenticator, "_review_token"):
+                    try:
+                        ok, uname = self.token_review_authenticator._review_token(presented)
+                        if ok and uname and self.token_review_authenticator.matches_service_account(uname):
+                            user = uname
+                    except Exception:
+                        pass
+                if user and user != "authenticated_sa":
+                    caller_sa = user
+                    self.caller_sa = user
+        if not caller_sa or caller_sa == "authenticated_sa":
             return "token", "token", None
 
         sa = caller_sa
@@ -2604,14 +2617,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     filename = key[len("attachment/") :]
                     content_bytes, mime = self.backend.get_attachment(namespace, secret, filename)
                     LOGGER.info(
-                        "secret read succeeded item=%s/%s filename=%s caller=%s service_account=%s caller_namespace=%s namespace=%s",
+                        "secret read succeeded item=%s/%s filename=%s caller=%s service_account=%s caller_namespace=%s",
                         namespace,
                         secret,
                         filename,
                         caller,
                         sa_name,
                         caller_ns or "-",
-                        namespace,
                     )
                     accept_header = self.headers.get("Accept", "").lower()
                     if "application/octet-stream" in accept_header or "application/x-binary" in accept_header:
@@ -2629,27 +2641,25 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 elif key is None:
                     values = self._get_with_autogen(namespace, secret, None)
                     LOGGER.info(
-                        "secret read succeeded item=%s/%s keys=%s caller=%s service_account=%s caller_namespace=%s namespace=%s",
+                        "secret read succeeded item=%s/%s keys=%s caller=%s service_account=%s caller_namespace=%s",
                         namespace,
                         secret,
                         list(values.keys()),
                         caller,
                         sa_name,
                         caller_ns or "-",
-                        namespace,
                     )
                     self._write_json(HTTPStatus.OK, {"data": values, **values})
                 else:
                     value = self._get_with_autogen(namespace, secret, key)
                     LOGGER.info(
-                        "secret read succeeded item=%s/%s key=%s caller=%s service_account=%s caller_namespace=%s namespace=%s",
+                        "secret read succeeded item=%s/%s key=%s caller=%s service_account=%s caller_namespace=%s",
                         namespace,
                         secret,
                         key,
                         caller,
                         sa_name,
                         caller_ns or "-",
-                        namespace,
                     )
                     self._write_json(HTTPStatus.OK, {"value": value})
             except ValueError as exc:

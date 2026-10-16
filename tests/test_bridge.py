@@ -1430,6 +1430,41 @@ class BridgeUnitTests(unittest.TestCase):
             h_no_auth.do_GET()
             self.assertEqual(h_no_auth.responses[-1]["status"], 401)
 
+    def test_handler_tokenreview_identity_is_request_scoped_and_fails_closed(self):
+        """A failed identity lookup cannot reuse identity state from another request."""
+        auth = bridge.TokenReviewAuthenticator(["system:serviceaccount:media:plex"])
+        self.assertFalse(hasattr(auth, "_last_user"))
+
+        class _TestHandler(bridge.BridgeRequestHandler):
+            def __init__(self):
+                self.path = "/v1/secret/media/plex/token"
+                self.headers = {"Authorization": "Bearer sa-jwt"}
+                self.responses = []
+
+            def send_response(self, status):
+                self.responses.append({"status": status, "headers": {}})
+
+            def send_header(self, key, value):
+                self.responses[-1]["headers"][key] = value
+
+            def end_headers(self):
+                pass
+
+            def _write_json(self, status, payload):
+                self.responses.append({"status": status, "payload": payload})
+
+        handler = bridge.BridgeRequestHandler
+        handler.token = ""
+        handler.token_review_authenticator = auth
+        handler.token_legacy_variants = False
+        request = _TestHandler()
+        with patch.object(auth, "get_authenticated_user", return_value=None), patch.object(
+            auth, "authenticate", return_value=True
+        ):
+            self.assertFalse(request._authorized())
+        self.assertIsNone(request.caller_sa)
+        self.assertEqual(request.auth_type, "")
+
     def test_tokenreview_least_privilege_namespace_matching(self):
         """Test least-privilege namespace matching rules."""
         # 1. Bare rules restrict to caller's own namespace
@@ -1450,7 +1485,7 @@ class BridgeUnitTests(unittest.TestCase):
         # 2. Explicit allowed namespaces with '='
         auth_explicit = bridge.TokenReviewAuthenticator([
             "system:serviceaccount:external-secrets:external-secrets=*",
-            "system:serviceaccount:monitoring:prometheus=monitoring;infra|cluster",
+            "system:serviceaccount:monitoring:prometheus=monitoring;infra;cluster",
             "system:serviceaccount:dev:runner=dev-*",
         ])
         # Wildcard namespace allows any
@@ -1465,6 +1500,11 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "dev-staging"))
         self.assertTrue(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "dev-test"))
         self.assertFalse(auth_explicit.is_namespace_allowed("system:serviceaccount:dev:runner", "prod"))
+
+        # Commas cannot safely delimit grants because the chart joins entries with commas.
+        auth_comma = bridge.TokenReviewAuthenticator(["system:serviceaccount:ops:runner=infra,billing"])
+        self.assertFalse(auth_comma.is_namespace_allowed("system:serviceaccount:ops:runner", "infra"))
+        self.assertFalse(auth_comma.is_namespace_allowed("system:serviceaccount:ops:runner", "billing"))
 
         # 3. Global wildcard SA allows any namespace
         auth_wildcard = bridge.TokenReviewAuthenticator(["*"])
@@ -1591,13 +1631,22 @@ class BridgeUnitTests(unittest.TestCase):
             h_push_forbidden.do_POST()
             self.assertEqual(h_push_forbidden.responses[-1]["status"], 403)
 
-            # 5. Admin operations blocked for restricted SA
+            # 5. PUT and DELETE must enforce the same namespace grant as GET/POST.
+            h_put_forbidden = _TestHandler("/v1/secret/finance/payroll/salary", auth_header, push_body)
+            h_put_forbidden.do_PUT()
+            self.assertEqual(h_put_forbidden.responses[-1]["status"], 403)
+
+            h_delete_forbidden = _TestHandler("/v1/secret/finance/payroll/salary", auth_header)
+            h_delete_forbidden.do_DELETE()
+            self.assertEqual(h_delete_forbidden.responses[-1]["status"], 403)
+
+            # 6. Admin operations blocked for restricted SA
             ensure_body = _json.dumps({"items": [{"name": "media/new", "fields": {"k": "v"}}]}).encode()
             h_admin = _TestHandler("/v1/admin/ensure", auth_header, ensure_body)
             h_admin.do_POST()
             self.assertEqual(h_admin.responses[-1]["status"], 403)
 
-            # 6. Cached token preserves caller identity and still enforces least privilege
+            # 7. Cached token preserves caller identity and still enforces least privilege
             h_cached_ok = _TestHandler("/v1/secret/media/plex/token", auth_header)
             h_cached_ok.do_GET()
             self.assertEqual(h_cached_ok.responses[-1]["status"], 200)

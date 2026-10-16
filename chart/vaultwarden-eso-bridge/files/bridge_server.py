@@ -412,14 +412,12 @@ class TokenReviewAuthenticator:
         self.token_path = token_path or os.getenv("KUBERNETES_TOKEN_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/token")
         self._lock = threading.Lock()
         self._cache: Dict[str, Tuple[float, bool, str]] = {}
-        self._last_user: Optional[str] = None
-
         self._rules: List[ServiceAccountRule] = []
         for raw_entry in self.allowed_service_accounts:
             if "=" in raw_entry:
                 pat, ns_str = raw_entry.split("=", 1)
                 pat = pat.strip()
-                ns_list = [ns.strip() for ns in re.split(r"[,;| ]+", ns_str) if ns.strip()]
+                ns_list = [ns.strip() for ns in ns_str.split(";") if ns.strip()]
                 self._rules.append(ServiceAccountRule(pat, ns_list, explicit_namespaces=True))
             else:
                 pat = raw_entry.strip()
@@ -517,9 +515,7 @@ class TokenReviewAuthenticator:
             with self._lock:
                 cached = self._cache.get(token)
                 if cached and cached[0] > now:
-                    user = cached[2] if cached[1] else None
-                    self._last_user = user
-                    return user
+                    return cached[2] if cached[1] else None
 
         authenticated, username = self._review_token(token)
         allowed = authenticated and self.matches_service_account(username)
@@ -530,7 +526,6 @@ class TokenReviewAuthenticator:
                 self._cache[token] = (now + ttl, allowed, username)
 
         user = username if allowed else None
-        self._last_user = user
         if allowed:
             LOGGER.debug("TokenReview authentication succeeded for user=%s", username)
         else:
@@ -2573,10 +2568,33 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 self.auth_type = "tokenreview"
                 self.caller_sa = user
                 return True
-            if self.token_review_authenticator.authenticate(presented):
-                self.auth_type = "tokenreview"
-                self.caller_sa = getattr(self.token_review_authenticator, "_last_user", None) or "authenticated_sa"
-                return True
+        return False
+
+    def _authorize_namespace(self, namespace: str, operation: str) -> bool:
+        """Authorize this request's TokenReview identity for a secret namespace."""
+        if self.auth_type != "tokenreview":
+            return True
+        authenticator = self.token_review_authenticator
+        caller = self.caller_sa
+        allowed = bool(authenticator and caller and authenticator.is_namespace_allowed(caller, namespace))
+        if allowed:
+            return True
+
+        LOGGER.warning(
+            "TokenReview access forbidden: user=%s not authorized to %s namespace=%s path=%s",
+            caller or "unknown",
+            operation,
+            namespace,
+            self.path,
+        )
+        self._write_json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": "forbidden",
+                "code": "forbidden",
+                "hint": f"Service account '{caller or 'unknown'}' is not permitted to access namespace '{namespace}'",
+            },
+        )
         return False
 
     def _get_with_autogen(self, namespace: str, secret: str, key: Optional[str]):
@@ -2665,24 +2683,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             try:
                 namespace, secret, key = parse_secret_path(self.path)
 
-                if self.auth_type == "tokenreview" and self.token_review_authenticator and self.caller_sa:
-                    if not self.token_review_authenticator.is_namespace_allowed(self.caller_sa, namespace):
-                        status_code = HTTPStatus.FORBIDDEN
-                        LOGGER.warning(
-                            "TokenReview access forbidden: user=%s not authorized to read namespace=%s path=%s",
-                            self.caller_sa,
-                            namespace,
-                            self.path,
-                        )
-                        self._write_json(
-                            HTTPStatus.FORBIDDEN,
-                            {
-                                "error": "forbidden",
-                                "code": "forbidden",
-                                "hint": f"Service account '{self.caller_sa}' is not permitted to access namespace '{namespace}'",
-                            },
-                        )
-                        return
+                if not self._authorize_namespace(namespace, "read"):
+                    status_code = HTTPStatus.FORBIDDEN
+                    return
 
                 if key is not None and key.startswith("attachment/"):
                     filename = key[len("attachment/") :]
@@ -2792,24 +2795,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/secret/"):
                 matched_path = "/v1/secret"
                 namespace, secret, key = parse_secret_path(self.path)
-                if self.auth_type == "tokenreview" and self.token_review_authenticator and self.caller_sa:
-                    if not self.token_review_authenticator.is_namespace_allowed(self.caller_sa, namespace):
-                        status_code = HTTPStatus.FORBIDDEN
-                        LOGGER.warning(
-                            "TokenReview access forbidden: user=%s not authorized to write namespace=%s path=%s",
-                            self.caller_sa,
-                            namespace,
-                            self.path,
-                        )
-                        self._write_json(
-                            HTTPStatus.FORBIDDEN,
-                            {
-                                "error": "forbidden",
-                                "code": "forbidden",
-                                "hint": f"Service account '{self.caller_sa}' is not permitted to access namespace '{namespace}'",
-                            },
-                        )
-                        return
+                if not self._authorize_namespace(namespace, "write"):
+                    status_code = HTTPStatus.FORBIDDEN
+                    return
                 if key:
                     val_str = ""
                     if isinstance(body, dict):
@@ -2951,6 +2939,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/secret/"):
                 matched_path = "/v1/secret"
                 namespace, secret, key = parse_secret_path(self.path)
+                if not self._authorize_namespace(namespace, "delete"):
+                    status_code = HTTPStatus.FORBIDDEN
+                    return
                 result = self.backend.delete_secret(namespace, secret, key)
                 LOGGER.info("push secret delete item=%s/%s key=%s status=%s", namespace, secret, key, result.get("status"))
                 self._write_json(HTTPStatus.OK, {"ok": True, "result": result})

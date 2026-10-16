@@ -32,6 +32,23 @@ perform package installs at pod startup.
 
 Prefer fixing the stored `BRIDGE_TOKEN` and client `Authorization` header so values match exactly, then leave legacy mode off.
 
+## TokenReview access migration
+
+TokenReview authorization is namespace-scoped. A bare entry in
+`auth.allowedServiceAccounts` (or `ALLOWED_SERVICE_ACCOUNTS`) now grants access
+only to the ServiceAccount's own namespace. Update overridden chart values that
+need cross-namespace access with explicit grants, for example
+`system:serviceaccount:external-secrets:external-secrets=media;prod`. Use
+`system:serviceaccount:external-secrets:external-secrets=*` for an unrestricted
+ServiceAccount; TokenReview calls to `/v1/admin/ensure` and `/v1/admin/rotate`
+also require this `=*` grant. The static bridge token can still access admin
+endpoints.
+
+Separate namespace grants with semicolons (`=media;prod`). The chart joins
+ServiceAccount entries with commas when building `ALLOWED_SERVICE_ACCOUNTS`,
+so commas cannot be used inside a grant: `=media,prod` is split as separate
+entries and will not grant both namespaces.
+
 ## Required Secrets and Values
 
 Required at minimum:

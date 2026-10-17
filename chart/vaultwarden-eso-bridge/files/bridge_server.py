@@ -2139,6 +2139,21 @@ def _signalr_msgpack_ping_frame() -> bytes:
     return bytes((len(body),)) + body
 
 
+class _SignalRIdle(Exception):
+    """The hub socket received nothing for a full keepalive interval."""
+
+
+def _format_host_header(host: str, port: int, is_ssl: bool) -> str:
+    """Return an HTTP Host value, without the port when it is the scheme default."""
+    if ":" in host:
+        display = f"[{host}]"
+    else:
+        display = host.encode("idna").decode("ascii")
+    if port == (443 if is_ssl else 80):
+        return display
+    return f"{display}:{port}"
+
+
 def _connection_id_from_negotiate_payload(payload: Dict[str, Any]) -> str:
     """Return the WebSocket id query value from a SignalR negotiate response.
 
@@ -2171,6 +2186,9 @@ class VaultwardenWebSocketClient:
     the WebSocket with that connection id (``?id=``) plus ``access_token``.
     Hubs that answer negotiate with 404 or 405 register the socket on the
     WebSocket upgrade itself, which is how current Vaultwarden behaves.
+    The upgrade is followed by a MessagePack handshake. WebSocket control
+    pings are ponged, and an idle socket sends a SignalR keepalive so the
+    server does not drop the subscription.
     """
 
     def __init__(
@@ -2182,12 +2200,14 @@ class VaultwardenWebSocketClient:
         max_reconnect_interval_seconds: float = 60.0,
         ssl_verify: bool = True,
         metrics: Optional[AuthMetrics] = None,
+        keepalive_interval_seconds: float = 15.0,
     ):
         self.server_url = server_url.strip()
         self.token = token.strip() if token else None
         self.on_notification = on_notification
         self.reconnect_interval = max(float(reconnect_interval_seconds), 1.0)
         self.max_reconnect_interval = max(float(max_reconnect_interval_seconds), self.reconnect_interval)
+        self.keepalive_interval = max(float(keepalive_interval_seconds), 0.2)
         self.ssl_verify = ssl_verify
         self.metrics = metrics
         self._running = False
@@ -2195,6 +2215,7 @@ class VaultwardenWebSocketClient:
         self._thread: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
+        self._recv_buf = b""
         self.notification_count = 0
 
     def is_connected(self) -> bool:
@@ -2326,6 +2347,7 @@ class VaultwardenWebSocketClient:
         return self._open_websocket(connection_id)
 
     def _open_websocket(self, connection_id: str) -> socket.socket:
+        self._recv_buf = b""
         parsed = urlparse(self.server_url)
         scheme = parsed.scheme.lower()
         is_ssl = scheme in ("wss", "https")
@@ -2334,37 +2356,49 @@ class VaultwardenWebSocketClient:
         path = self._websocket_request_path(connection_id)
 
         raw_sock = socket.create_connection((host, port), timeout=15)
-        if is_ssl:
-            sock = self._ssl_context().wrap_socket(raw_sock, server_hostname=host)
-        else:
-            sock = raw_sock
+        sock: socket.socket = raw_sock
+        try:
+            if is_ssl:
+                sock = self._ssl_context().wrap_socket(raw_sock, server_hostname=host)
 
-        sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
-        headers = [
-            f"GET {path} HTTP/1.1",
-            f"Host: {host}:{port}",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            f"Sec-WebSocket-Key: {sec_key}",
-            "Sec-WebSocket-Version: 13",
-        ]
-        if self.token:
-            headers.append(f"Authorization: Bearer {self.token}")
-        headers.extend(["", ""])
-        sock.sendall("\r\n".join(headers).encode("ascii"))
+            sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+            headers = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {_format_host_header(host, port, is_ssl)}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {sec_key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            if self.token:
+                headers.append(f"Authorization: Bearer {self.token}")
+            headers.extend(["", ""])
+            sock.sendall("\r\n".join(headers).encode("ascii"))
 
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(1024)
-            if not chunk:
-                raise ConnectionError("Server closed connection during WebSocket handshake")
-            response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Server closed connection during WebSocket handshake")
+                response += chunk
+                if len(response) > 65536:
+                    raise ConnectionError("WebSocket handshake response is too large")
 
-        first_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
-        if not (" 101 " in first_line or first_line.endswith(" 101")):
-            raise ConnectionError(f"WebSocket handshake rejected by server: {first_line}")
+            header_bytes, _, leftover = response.partition(b"\r\n\r\n")
+            first_line = header_bytes.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+            if " 101 " not in first_line and not first_line.endswith(" 101"):
+                raise ConnectionError(f"WebSocket handshake rejected by server: {first_line}")
 
-        return sock
+            # The first hub frame often shares a TCP packet with the 101 response.
+            self._recv_buf = leftover
+            sock.settimeout(None)
+            return sock
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
 
     def _send_ws_frame(self, sock: socket.socket, payload: bytes, opcode: int = 0x1) -> None:
         """Send a client-to-server masked WebSocket frame."""
@@ -2385,10 +2419,31 @@ class VaultwardenWebSocketClient:
         header.extend(mask_key)
         sock.sendall(header + masked_payload)
 
-    def _recv_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
+    def _recv_exact(self, sock: socket.socket, num_bytes: int, *, idle_first: bool = False) -> bytes:
+        """Read exactly num_bytes, consuming any bytes buffered from the 101 response.
+
+        The first byte of a new frame waits only for the keepalive interval.
+        A timeout there means the socket is idle. A timeout after any byte has
+        arrived means the frame was cut off.
+        """
         buf = bytearray()
         while len(buf) < num_bytes:
-            chunk = sock.recv(num_bytes - len(buf))
+            need = num_bytes - len(buf)
+            if self._recv_buf:
+                take = self._recv_buf[:need]
+                self._recv_buf = self._recv_buf[need:]
+                buf.extend(take)
+                continue
+            waiting_for_frame = idle_first and not buf
+            sock.settimeout(self.keepalive_interval if waiting_for_frame else 30)
+            try:
+                chunk = sock.recv(need)
+            except (TimeoutError, socket.timeout):
+                if waiting_for_frame:
+                    raise _SignalRIdle() from None
+                raise ConnectionError("Timed out while reading WebSocket frame") from None
+            finally:
+                sock.settimeout(None)
             if not chunk:
                 raise ConnectionError("Connection closed while reading WebSocket frame")
             buf.extend(chunk)
@@ -2396,7 +2451,7 @@ class VaultwardenWebSocketClient:
 
     def _recv_ws_frame(self, sock: socket.socket) -> Tuple[int, bytes]:
         """Receive a WebSocket frame (opcode, payload)."""
-        header = self._recv_exact(sock, 2)
+        header = self._recv_exact(sock, 2, idle_first=True)
         opcode = header[0] & 0x0F
         has_mask = bool(header[1] & 0x80)
         length = header[1] & 0x7F
@@ -2426,7 +2481,7 @@ class VaultwardenWebSocketClient:
             except Exception as exc:
                 LOGGER.error("Error in on_notification callback: %s", exc)
 
-    def _consume_json_messages(self, sock: socket.socket, buffer: str) -> str:
+    def _consume_json_messages(self, _sock: socket.socket, buffer: str) -> str:
         while "\x1e" in buffer:
             msg_str, buffer = buffer.split("\x1e", 1)
             msg_str = msg_str.strip()
@@ -2438,10 +2493,18 @@ class VaultwardenWebSocketClient:
                 continue
             if not isinstance(msg, dict):
                 continue
+            # A handshake response is ``{}`` on success and ``{"error": "..."}``
+            # when the server rejects the selected protocol.
+            if msg.get("type") is None and "error" in msg:
+                detail = msg.get("error")
+                text = detail if isinstance(detail, str) and detail else "handshake failed"
+                raise ConnectionError(f"SignalR handshake rejected: {text}")
             msg_type = msg.get("type")
             if msg_type == 6:
-                self._send_ws_frame(sock, b'{"type":6}\x1e', opcode=0x1)
-            elif msg_type == 1:
+                # Protocol pings are not answered. Vaultwarden echoes any
+                # non-handshake frame, so a ping reply becomes a ping loop.
+                continue
+            if msg_type == 1:
                 target = msg.get("target", "")
                 args = msg.get("arguments", [])
                 if not isinstance(args, list):
@@ -2449,12 +2512,11 @@ class VaultwardenWebSocketClient:
                 self._emit_notification(str(target), args)
         return buffer
 
-    def _handle_msgpack_message(self, sock: socket.socket, message: Any) -> None:
+    def _handle_msgpack_message(self, _sock: socket.socket, message: Any) -> None:
         if not isinstance(message, list) or not message:
             return
         msg_type = message[0]
         if msg_type == 6:
-            self._send_ws_frame(sock, _signalr_msgpack_ping_frame(), opcode=0x2)
             return
         if msg_type != 1 or len(message) < 5:
             return
@@ -2470,12 +2532,10 @@ class VaultwardenWebSocketClient:
         SignalR's binary length prefix.
         """
         try:
-            candidate = frame_data.strip()
-            if candidate.endswith(b"\x1e"):
-                candidate = candidate[:-1].strip()
-            if candidate.startswith((b"{", b"[")):
+            stripped = frame_data.strip()
+            if stripped.endswith(b"\x1e") and stripped[:1] in (b"{", b"["):
                 try:
-                    json.loads(candidate.decode("utf-8"))
+                    json.loads(stripped[:-1].strip().decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     pass
                 else:
@@ -2483,6 +2543,8 @@ class VaultwardenWebSocketClient:
                     return
             for message in _iter_signalr_msgpack_messages(frame_data):
                 self._handle_msgpack_message(sock, message)
+        except ConnectionError:
+            raise
         except Exception:
             LOGGER.debug("Ignoring unrecognized SignalR binary frame")
 
@@ -2506,7 +2568,16 @@ class VaultwardenWebSocketClient:
 
                 buffer = ""
                 while self._running:
-                    opcode, frame_data = self._recv_ws_frame(sock)
+                    try:
+                        opcode, frame_data = self._recv_ws_frame(sock)
+                    except _SignalRIdle:
+                        if not self._running:
+                            break
+                        # ASP.NET SignalR drops a client that sends nothing for
+                        # ClientTimeoutInterval (30s). Vaultwarden resets its
+                        # 30s timer on any client frame, including this ping.
+                        self._send_ws_frame(sock, _signalr_msgpack_ping_frame(), opcode=0x2)
+                        continue
                     if opcode == 0x8:  # CLOSE
                         break
                     elif opcode == 0x9:  # PING

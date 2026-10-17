@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.7.1...v0.8.0) (2026-10-17)
+
+
+### Features
+
+* **sync:** join the Vaultwarden notifications hub ([#53](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/53)) ([#64](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/64)) ([f3fa3cb](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/f3fa3cb94aa54526f3df2e29dcea33e3cae9b828))
+
 ## [0.7.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.7.0...v0.7.1) (2026-09-23)
 
 

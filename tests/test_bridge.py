@@ -1,8 +1,13 @@
 import importlib.util
+import json
 import os
 import pathlib
+import socket
+import struct
 import subprocess
+import threading
 import time
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +32,128 @@ def _load_module():
 
 
 bridge = _load_module()
+
+
+def _read_http_request(conn):
+    conn.settimeout(5)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip() or b"0")
+    while len(rest) < length:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return head, rest[:length]
+
+
+def _recv_exact(conn, size):
+    buf = b""
+    while len(buf) < size:
+        chunk = conn.recv(size - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed")
+        buf += chunk
+    return buf
+
+
+def _read_client_ws_frame(conn):
+    header = _recv_exact(conn, 2)
+    masked = bool(header[1] & 0x80)
+    length = header[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact(conn, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact(conn, 8))[0]
+    mask = _recv_exact(conn, 4) if masked else b""
+    payload = _recv_exact(conn, length)
+    if masked:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return header[0] & 0x0F, payload
+
+
+def _ws_server_frame(opcode, payload):
+    frame = bytearray()
+    frame.append(0x80 | (opcode & 0x0F))
+    length = len(payload)
+    if length < 126:
+        frame.append(length)
+    elif length < 65536:
+        frame.append(126)
+        frame.extend(struct.pack("!H", length))
+    else:
+        frame.append(127)
+        frame.extend(struct.pack("!Q", length))
+    frame.extend(payload)
+    return bytes(frame)
+
+
+def _start_hub_server(negotiate_handler, ws_handler=None):
+    """Serve one SignalR negotiate response and an optional WebSocket upgrade."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    captured = {"negotiate": [], "websocket": [], "handshake": b"", "error": ""}
+
+    def _serve():
+        try:
+            conn, _ = srv.accept()
+            try:
+                head, body = _read_http_request(conn)
+                captured["negotiate"].append(head + b"\r\n\r\n" + body)
+                status, resp_body = negotiate_handler(head, body)
+                payload = resp_body if isinstance(resp_body, bytes) else json.dumps(resp_body).encode()
+                response = (
+                    b"HTTP/1.1 " + status + b"\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(payload)).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + payload
+                )
+                conn.sendall(response)
+            finally:
+                conn.close()
+            if ws_handler is None:
+                return
+            conn, _ = srv.accept()
+            try:
+                head, _body = _read_http_request(conn)
+                captured["websocket"].append(head)
+                conn.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+                )
+                ws_handler(conn, captured)
+            finally:
+                conn.close()
+        except Exception:
+            captured["error"] = traceback.format_exc()
+        finally:
+            srv.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return port, thread, captured
+
+
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
 
 
 class BridgeUnitTests(unittest.TestCase):
@@ -1806,85 +1933,298 @@ class BridgeUnitTests(unittest.TestCase):
         with self.assertRaises(bridge.SecretLookupError):
             backend.get_all_values("media", "plex")
 
-    def test_websocket_client_framing_and_signalr(self):
-        """Test VaultwardenWebSocketClient RFC 6455 framing and SignalR message dispatch."""
-        import socket
-        import struct
-        import threading
-
-        # Bind an ephemeral local port
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
-        port = srv.getsockname()[1]
-
-        events_received = []
-        def _handle_event(target, args):
-            events_received.append((target, args))
-
-        def _mock_server():
-            conn, _ = srv.accept()
-            try:
-                # 1. Read HTTP handshake
-                req = b""
-                while b"\r\n\r\n" not in req:
-                    req += conn.recv(1024)
-
-                # 2. Send 101 Switching Protocols
-                resp = (
-                    b"HTTP/1.1 101 Switching Protocols\r\n"
-                    b"Upgrade: websocket\r\n"
-                    b"Connection: Upgrade\r\n"
-                    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
-                )
-                conn.sendall(resp)
-
-                # 3. Read client's SignalR protocol handshake
-                # Unmask text frame
-                header = conn.recv(2)
-                mask = conn.recv(4)
-                payload_len = header[1] & 0x7F
-                masked_payload = conn.recv(payload_len)
-                # Client sent: {"protocol":"json","version":1}\x1e
-
-                # 4. Server sends SignalR notification: {"type":1,"target":"SyncVault","arguments":["user-42"]}\x1e
-                event_payload = b'{"type":1,"target":"SyncVault","arguments":["user-42"]}\x1e'
-                frame = bytearray()
-                frame.append(0x81)  # FIN + text
-                frame.append(len(event_payload))  # Unmasked server frame
-                frame.extend(event_payload)
-                conn.sendall(frame)
-
-                # Keep open briefly
-                time.sleep(0.1)
-            finally:
-                conn.close()
-                srv.close()
-
-        server_thread = threading.Thread(target=_mock_server, daemon=True)
-        server_thread.start()
-
+    def _run_ws_client(self, port, on_notification, reconnect_interval_seconds=1.0):
         metrics = bridge.AuthMetrics()
         client = bridge.VaultwardenWebSocketClient(
             server_url=f"ws://127.0.0.1:{port}/notifications/hub",
             token="test-token",
-            on_notification=_handle_event,
-            reconnect_interval_seconds=1.0,
+            on_notification=on_notification,
+            reconnect_interval_seconds=reconnect_interval_seconds,
             metrics=metrics,
         )
+        return client, metrics
+
+    def test_websocket_client_negotiates_connection_id(self):
+        """Negotiate, then join the hub with id and dispatch a JSON invocation."""
+        events_received = []
+
+        def _negotiate(_head, _body):
+            return (
+                b"200 OK",
+                {
+                    "negotiateVersion": 1,
+                    "connectionId": "public-id",
+                    "connectionToken": "private-token",
+                    "availableTransports": [
+                        {"transport": "WebSockets", "transferFormats": ["Text", "Binary"]}
+                    ],
+                },
+            )
+
+        def _websocket(conn, captured):
+            _opcode, payload = _read_client_ws_frame(conn)
+            captured["handshake"] = payload
+            event = b'{"type":1,"target":"SyncVault","arguments":["user-42"]}\x1e'
+            conn.sendall(_ws_server_frame(0x1, event))
+            time.sleep(0.2)
+
+        port, thread, captured = _start_hub_server(_negotiate, _websocket)
+        client, metrics = self._run_ws_client(port, lambda target, args: events_received.append((target, args)))
         client.start()
+        try:
+            received = _wait_until(lambda: events_received)
+        finally:
+            client.stop()
+            thread.join(timeout=2)
 
-        # Wait for notification to be received
-        for _ in range(50):
-            if events_received:
-                break
-            time.sleep(0.02)
-
-        client.stop()
-        self.assertTrue(len(events_received) >= 1)
-        self.assertEqual(events_received[0][0], "SyncVault")
-        self.assertEqual(events_received[0][1], ["user-42"])
+        self.assertEqual(captured["error"], "")
+        negotiate = captured["negotiate"][0].decode()
+        self.assertTrue(negotiate.startswith("POST /notifications/hub/negotiate?negotiateVersion=1 "))
+        self.assertIn("Authorization: Bearer test-token", negotiate)
+        websocket = captured["websocket"][0].decode()
+        self.assertIn("GET /notifications/hub?id=private-token&access_token=test-token ", websocket)
+        self.assertNotIn("id=public-id", websocket)
+        self.assertIn("Authorization: Bearer test-token", websocket)
+        self.assertEqual(captured["handshake"], b'{"protocol":"messagepack","version":1}\x1e')
+        self.assertTrue(received)
+        self.assertEqual(events_received[0], ("SyncVault", ["user-42"]))
         self.assertEqual(metrics.websocket_notifications_total, 1)
+
+    def test_websocket_client_uses_connection_id_for_negotiate_v0(self):
+        """Older negotiate payloads identify the socket with connectionId."""
+
+        def _negotiate(_head, _body):
+            return (
+                b"200 OK",
+                {
+                    "connectionId": "conn-v0",
+                    "connectionToken": "should-not-use",
+                    "availableTransports": [
+                        {"transport": "WebSockets", "transferFormats": ["Text", "Binary"]}
+                    ],
+                },
+            )
+
+        def _websocket(conn, captured):
+            _opcode, payload = _read_client_ws_frame(conn)
+            captured["handshake"] = payload
+            time.sleep(0.05)
+
+        port, thread, captured = _start_hub_server(_negotiate, _websocket)
+        client, _metrics = self._run_ws_client(port, lambda _target, _args: None)
+        client.start()
+        try:
+            opened = _wait_until(lambda: captured["websocket"])
+        finally:
+            client.stop()
+            thread.join(timeout=2)
+
+        self.assertEqual(captured["error"], "")
+        self.assertTrue(opened)
+        websocket = captured["websocket"][0].decode()
+        self.assertIn("id=conn-v0", websocket)
+        self.assertNotIn("should-not-use", websocket)
+
+    def test_websocket_client_joins_directly_when_negotiate_is_missing(self):
+        """Current Vaultwarden has no negotiate route and joins on the upgrade."""
+        events_received = []
+
+        def _negotiate(_head, _body):
+            return b"404 Not Found", b"no negotiate"
+
+        def _websocket(conn, captured):
+            _opcode, payload = _read_client_ws_frame(conn)
+            captured["handshake"] = payload
+            event = b'{"type":1,"target":"SyncCipherUpdate","arguments":[{"Id":"item-1"}]}\x1e'
+            conn.sendall(_ws_server_frame(0x1, event))
+            time.sleep(0.2)
+
+        port, thread, captured = _start_hub_server(_negotiate, _websocket)
+        client, metrics = self._run_ws_client(port, lambda target, args: events_received.append((target, args)))
+        client.start()
+        try:
+            received = _wait_until(lambda: events_received)
+        finally:
+            client.stop()
+            thread.join(timeout=2)
+
+        self.assertEqual(captured["error"], "")
+        websocket = captured["websocket"][0].decode()
+        request_line = websocket.split("\r\n", 1)[0]
+        self.assertTrue(request_line.startswith("GET /notifications/hub?"))
+        self.assertNotIn("id=", request_line)
+        self.assertIn("access_token=test-token", request_line)
+        self.assertTrue(received)
+        self.assertEqual(events_received[0][0], "SyncCipherUpdate")
+        self.assertEqual(metrics.websocket_notifications_total, 1)
+
+    def test_websocket_negotiate_auth_failure_does_not_open_hub(self):
+        def _negotiate(_head, _body):
+            return b"401 Unauthorized", b"denied"
+
+        port, thread, captured = _start_hub_server(_negotiate, None)
+        client, _metrics = self._run_ws_client(port, lambda _target, _args: None)
+        client.start()
+        try:
+            saw_negotiate = _wait_until(lambda: captured["negotiate"])
+        finally:
+            client.stop()
+            thread.join(timeout=2)
+
+        self.assertTrue(saw_negotiate)
+        self.assertEqual(captured["websocket"], [])
+        self.assertEqual(len(captured["negotiate"]), 1)
+        self.assertIn(b"POST /notifications/hub/negotiate?negotiateVersion=1 ", captured["negotiate"][0])
+
+    def test_websocket_client_messagepack_notification(self):
+        """Vaultwarden pushes ReceiveMessage as a length-prefixed MessagePack frame."""
+        events_received = []
+        # [1, {}, null, "ReceiveMessage", [{"Type": 5}]]
+        body = bytes(
+            [
+                0x95,
+                0x01,
+                0x80,
+                0xC0,
+                0xAE,
+                0x52,
+                0x65,
+                0x63,
+                0x65,
+                0x69,
+                0x76,
+                0x65,
+                0x4D,
+                0x65,
+                0x73,
+                0x73,
+                0x61,
+                0x67,
+                0x65,
+                0x91,
+                0x81,
+                0xA4,
+                0x54,
+                0x79,
+                0x70,
+                0x65,
+                0x05,
+            ]
+        )
+        frame = bytes([len(body)]) + body
+
+        def _negotiate(_head, _body):
+            return b"200 OK", {"negotiateVersion": 1, "connectionToken": "pack-token", "connectionId": "public"}
+
+        def _websocket(conn, _captured):
+            _read_client_ws_frame(conn)
+            conn.sendall(_ws_server_frame(0x2, b"{}\x1e"))
+            conn.sendall(_ws_server_frame(0x2, frame))
+            time.sleep(0.2)
+
+        port, thread, captured = _start_hub_server(_negotiate, _websocket)
+        client, metrics = self._run_ws_client(port, lambda target, args: events_received.append((target, args)))
+        client.start()
+        try:
+            received = _wait_until(lambda: events_received)
+        finally:
+            client.stop()
+            thread.join(timeout=2)
+
+        self.assertEqual(captured["error"], "")
+        self.assertIn("id=pack-token", captured["websocket"][0].decode())
+        self.assertTrue(received)
+        self.assertEqual(events_received[0][0], "ReceiveMessage")
+        self.assertEqual(events_received[0][1], [{"Type": 5}])
+        self.assertEqual(metrics.websocket_notifications_total, 1)
+
+    def test_signalr_negotiate_url_and_connection_id(self):
+        client = bridge.VaultwardenWebSocketClient(
+            server_url="wss://vault.example:8443/notifications/hub?foo=1",
+            token="tok en",
+        )
+        self.assertEqual(
+            client._build_negotiate_url(),
+            "https://vault.example:8443/notifications/hub/negotiate?foo=1&negotiateVersion=1",
+        )
+        self.assertEqual(
+            client._websocket_request_path("a+b/c="),
+            "/notifications/hub?foo=1&id=a%2Bb%2Fc%3D&access_token=tok%20en",
+        )
+
+        preset = bridge.VaultwardenWebSocketClient(
+            server_url="ws://vault.example/notifications/hub?negotiateVersion=0&access_token=already",
+            token="other",
+        )
+        self.assertEqual(
+            preset._build_negotiate_url(),
+            "http://vault.example/notifications/hub/negotiate?negotiateVersion=0&access_token=already",
+        )
+        self.assertEqual(
+            preset._websocket_request_path("abc"),
+            "/notifications/hub?negotiateVersion=0&access_token=already&id=abc",
+        )
+
+        self.assertEqual(
+            bridge._connection_id_from_negotiate_payload(
+                {"connectionId": "public", "connectionToken": "private"}
+            ),
+            "public",
+        )
+        self.assertEqual(
+            bridge._connection_id_from_negotiate_payload(
+                {"negotiateVersion": 1, "connectionId": "public", "connectionToken": "private"}
+            ),
+            "private",
+        )
+        with self.assertRaises(ConnectionError):
+            bridge._connection_id_from_negotiate_payload(
+                {
+                    "negotiateVersion": 1,
+                    "connectionToken": "token",
+                    "availableTransports": [{"transport": "LongPolling", "transferFormats": ["Text"]}],
+                }
+            )
+        with self.assertRaises(ConnectionError):
+            bridge._connection_id_from_negotiate_payload({"negotiateVersion": 1})
+
+    def test_signalr_msgpack_frames_decode_invocation_ping_and_timestamp(self):
+        body = bytes(
+            [
+                0x95,
+                0x01,
+                0x80,
+                0xC0,
+                0xAE,
+                0x52,
+                0x65,
+                0x63,
+                0x65,
+                0x69,
+                0x76,
+                0x65,
+                0x4D,
+                0x65,
+                0x73,
+                0x73,
+                0x61,
+                0x67,
+                0x65,
+                0x91,
+                0x81,
+                0xA4,
+                0x54,
+                0x79,
+                0x70,
+                0x65,
+                0x05,
+            ]
+        )
+        messages = bridge._iter_signalr_msgpack_messages(bytes([len(body)]) + body)
+        self.assertEqual(messages, [[1, {}, None, "ReceiveMessage", [{"Type": 5}]]])
+        self.assertEqual(bridge._iter_signalr_msgpack_messages(bridge._signalr_msgpack_ping_frame()), [[6]])
+        stamped, consumed = bridge._decode_msgpack_at(bytes([0xD6, 0xFF, 0x00, 0x00, 0x00, 0x02]), 0)
+        self.assertEqual((stamped, consumed), (2, 6))
 
     def test_build_config_websocket_sync_enabled(self):
         """Test build_config_from_env parses WebSocket sync parameters."""

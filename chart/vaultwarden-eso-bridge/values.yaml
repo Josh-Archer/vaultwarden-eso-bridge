@@ -27,8 +27,10 @@ auth:
   tokenReview:
     enabled: false
     # Allowed ServiceAccount identities (full name, namespace:name, or namespace:*).
+    # To restrict or grant namespaces/folders, append =<ns1;ns2> or =* (e.g. sa=media;prod or sa=*).
+    # When no =namespaces suffix is specified, a ServiceAccount can only read secrets in its own namespace.
     allowedServiceAccounts:
-      - "system:serviceaccount:external-secrets:external-secrets"
+      - "system:serviceaccount:external-secrets:external-secrets=*"
     # In-process cache TTL for validated SA tokens (seconds).
     cacheTtlSeconds: 300
     # Optional target audiences for TokenReview validation.

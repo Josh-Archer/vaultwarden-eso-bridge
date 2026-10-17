@@ -34,7 +34,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import urllib.error
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 import urllib.request
 
 LOGGER = logging.getLogger("vaultwarden-eso-bridge")
@@ -1980,8 +1980,216 @@ class BwsBackend(SecretBackend):
         LOGGER.info("BwsBackend cache invalidated via WebSocket event")
 
 
+# SignalR JSON handshake selects the hub protocol. Vaultwarden and Bitwarden
+# notifications hubs both require MessagePack after this record.
+_SIGNALR_HANDSHAKE = b'{"protocol":"messagepack","version":1}\x1e'
+
+
+def _read_exact_buf(buf: bytes, offset: int, size: int) -> Tuple[bytes, int]:
+    end = offset + size
+    if size < 0 or end > len(buf):
+        raise ValueError("truncated msgpack value")
+    return buf[offset:end], end
+
+
+def _decode_extension(ext_type: int, data: bytes) -> Any:
+    """Decode a MessagePack extension. Type -1 is the timestamp extension."""
+    if ext_type == -1:
+        if len(data) == 4:
+            return int.from_bytes(data, "big")
+        if len(data) == 8:
+            return int.from_bytes(data, "big") & 0x3FFFFFFFF
+        if len(data) == 12:
+            return int.from_bytes(data[4:], "big", signed=True)
+    return {"ext": ext_type, "data": data.hex()}
+
+
+def _decode_msgpack_at(buf: bytes, offset: int) -> Tuple[Any, int]:
+    """Decode one MessagePack value. Returns the value and the next offset."""
+    if offset >= len(buf):
+        raise ValueError("truncated msgpack value")
+    marker = buf[offset]
+    offset += 1
+
+    if marker <= 0x7F:
+        return marker, offset
+    if marker >= 0xE0:
+        return marker - 256, offset
+    if 0x80 <= marker <= 0x8F:
+        return _decode_msgpack_map(buf, offset, marker & 0x0F)
+    if 0x90 <= marker <= 0x9F:
+        return _decode_msgpack_array(buf, offset, marker & 0x0F)
+    if 0xA0 <= marker <= 0xBF:
+        return _decode_msgpack_str(buf, offset, marker & 0x1F)
+    if marker == 0xC0:
+        return None, offset
+    if marker == 0xC2:
+        return False, offset
+    if marker == 0xC3:
+        return True, offset
+    if marker in (0xC4, 0xC5, 0xC6):
+        width = {0xC4: 1, 0xC5: 2, 0xC6: 4}[marker]
+        length, offset = _read_msgpack_uint(buf, offset, width)
+        data, offset = _read_exact_buf(buf, offset, length)
+        return data, offset
+    if marker in (0xC7, 0xC8, 0xC9):
+        width = {0xC7: 1, 0xC8: 2, 0xC9: 4}[marker]
+        length, offset = _read_msgpack_uint(buf, offset, width)
+        ext_type, offset = _read_msgpack_int(buf, offset, 1)
+        data, offset = _read_exact_buf(buf, offset, length)
+        return _decode_extension(ext_type, data), offset
+    if marker == 0xCA:
+        data, offset = _read_exact_buf(buf, offset, 4)
+        return struct.unpack("!f", data)[0], offset
+    if marker == 0xCB:
+        data, offset = _read_exact_buf(buf, offset, 8)
+        return struct.unpack("!d", data)[0], offset
+    if marker in (0xCC, 0xCD, 0xCE, 0xCF):
+        width = {0xCC: 1, 0xCD: 2, 0xCE: 4, 0xCF: 8}[marker]
+        return _read_msgpack_uint(buf, offset, width)
+    if marker in (0xD0, 0xD1, 0xD2, 0xD3):
+        width = {0xD0: 1, 0xD1: 2, 0xD2: 4, 0xD3: 8}[marker]
+        return _read_msgpack_int(buf, offset, width)
+    if marker in (0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
+        size = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}[marker]
+        ext_type, offset = _read_msgpack_int(buf, offset, 1)
+        data, offset = _read_exact_buf(buf, offset, size)
+        return _decode_extension(ext_type, data), offset
+    if marker in (0xD9, 0xDA, 0xDB):
+        width = {0xD9: 1, 0xDA: 2, 0xDB: 4}[marker]
+        length, offset = _read_msgpack_uint(buf, offset, width)
+        return _decode_msgpack_str(buf, offset, length)
+    if marker in (0xDC, 0xDD):
+        width = 2 if marker == 0xDC else 4
+        length, offset = _read_msgpack_uint(buf, offset, width)
+        return _decode_msgpack_array(buf, offset, length)
+    if marker in (0xDE, 0xDF):
+        width = 2 if marker == 0xDE else 4
+        length, offset = _read_msgpack_uint(buf, offset, width)
+        return _decode_msgpack_map(buf, offset, length)
+    raise ValueError(f"unsupported msgpack marker {marker:#x}")
+
+
+def _read_msgpack_uint(buf: bytes, offset: int, width: int) -> Tuple[int, int]:
+    data, offset = _read_exact_buf(buf, offset, width)
+    return int.from_bytes(data, "big"), offset
+
+
+def _read_msgpack_int(buf: bytes, offset: int, width: int) -> Tuple[int, int]:
+    data, offset = _read_exact_buf(buf, offset, width)
+    return int.from_bytes(data, "big", signed=True), offset
+
+
+def _decode_msgpack_str(buf: bytes, offset: int, length: int) -> Tuple[str, int]:
+    data, offset = _read_exact_buf(buf, offset, length)
+    return data.decode("utf-8"), offset
+
+
+def _decode_msgpack_array(buf: bytes, offset: int, count: int) -> Tuple[List[Any], int]:
+    items: List[Any] = []
+    for _ in range(count):
+        item, offset = _decode_msgpack_at(buf, offset)
+        items.append(item)
+    return items, offset
+
+
+def _decode_msgpack_map(buf: bytes, offset: int, count: int) -> Tuple[Dict[Any, Any], int]:
+    result: Dict[Any, Any] = {}
+    for _ in range(count):
+        key, offset = _decode_msgpack_at(buf, offset)
+        value, offset = _decode_msgpack_at(buf, offset)
+        if isinstance(key, bytes):
+            key = key.decode("utf-8", errors="replace")
+        result[key] = value
+    return result, offset
+
+
+def _iter_signalr_msgpack_messages(payload: bytes) -> List[Any]:
+    """Split a SignalR BinaryMessageFormat frame into MessagePack values."""
+    messages: List[Any] = []
+    offset = 0
+    total = len(payload)
+    while offset < total:
+        size = 0
+        shift = 0
+        while True:
+            if offset >= total:
+                raise ValueError("truncated signalr message length")
+            byte = payload[offset]
+            offset += 1
+            size |= (byte & 0x7F) << shift
+            if byte & 0x80 == 0:
+                break
+            shift += 7
+            if shift > 28:
+                raise ValueError("signalr message length is too large")
+        chunk, offset = _read_exact_buf(payload, offset, size)
+        if not chunk:
+            continue
+        message, consumed = _decode_msgpack_at(chunk, 0)
+        if consumed != len(chunk):
+            raise ValueError("msgpack value did not fill the signalr message")
+        messages.append(message)
+    return messages
+
+
+def _signalr_msgpack_ping_frame() -> bytes:
+    """MessagePack encoding of a SignalR ping, wrapped in BinaryMessageFormat."""
+    body = bytes((0x91, 0x06))
+    return bytes((len(body),)) + body
+
+
+class _SignalRIdle(Exception):
+    """The hub socket received nothing for a full keepalive interval."""
+
+
+def _format_host_header(host: str, port: int, is_ssl: bool) -> str:
+    """Return an HTTP Host value, without the port when it is the scheme default."""
+    if ":" in host:
+        display = f"[{host}]"
+    else:
+        display = host.encode("idna").decode("ascii")
+    if port == (443 if is_ssl else 80):
+        return display
+    return f"{display}:{port}"
+
+
+def _connection_id_from_negotiate_payload(payload: Dict[str, Any]) -> str:
+    """Return the WebSocket id query value from a SignalR negotiate response.
+
+    negotiateVersion 1 uses connectionToken. Older payloads use connectionId.
+    """
+    version_raw = payload.get("negotiateVersion") or 0
+    try:
+        version = int(version_raw)
+    except (TypeError, ValueError):
+        version = 0
+
+    transports = payload.get("availableTransports")
+    if isinstance(transports, list) and transports:
+        if not any(isinstance(item, dict) and item.get("transport") == "WebSockets" for item in transports):
+            raise ConnectionError("SignalR negotiate did not offer the WebSockets transport")
+
+    if version >= 1:
+        token = payload.get("connectionToken") or payload.get("connectionId")
+    else:
+        token = payload.get("connectionId")
+    if not token:
+        raise ConnectionError("SignalR negotiate response missing connection id")
+    return str(token)
+
+
 class VaultwardenWebSocketClient:
-    """Event-driven SignalR WebSocket client for Vaultwarden /notifications/hub."""
+    """Event-driven SignalR client for the Vaultwarden notifications hub.
+
+    The hub is joined by POSTing to ``/notifications/hub/negotiate`` and opening
+    the WebSocket with that connection id (``?id=``) plus ``access_token``.
+    Hubs that answer negotiate with 404 or 405 register the socket on the
+    WebSocket upgrade itself, which is how current Vaultwarden behaves.
+    The upgrade is followed by a MessagePack handshake. WebSocket control
+    pings are ponged, and an idle socket sends a SignalR keepalive so the
+    server does not drop the subscription.
+    """
 
     def __init__(
         self,
@@ -1992,12 +2200,14 @@ class VaultwardenWebSocketClient:
         max_reconnect_interval_seconds: float = 60.0,
         ssl_verify: bool = True,
         metrics: Optional[AuthMetrics] = None,
+        keepalive_interval_seconds: float = 15.0,
     ):
         self.server_url = server_url.strip()
         self.token = token.strip() if token else None
         self.on_notification = on_notification
         self.reconnect_interval = max(float(reconnect_interval_seconds), 1.0)
         self.max_reconnect_interval = max(float(max_reconnect_interval_seconds), self.reconnect_interval)
+        self.keepalive_interval = max(float(keepalive_interval_seconds), 0.2)
         self.ssl_verify = ssl_verify
         self.metrics = metrics
         self._running = False
@@ -2005,6 +2215,7 @@ class VaultwardenWebSocketClient:
         self._thread: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
+        self._recv_buf = b""
         self.notification_count = 0
 
     def is_connected(self) -> bool:
@@ -2036,53 +2247,158 @@ class VaultwardenWebSocketClient:
             self.metrics.set_websocket_connected(False)
         LOGGER.info("Vaultwarden WebSocket listener stopped")
 
+    def _ssl_context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context()
+        if not self.ssl_verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        return context
+
+    def _build_negotiate_url(self) -> str:
+        parsed = urlparse(self.server_url)
+        scheme = parsed.scheme.lower()
+        if scheme == "wss":
+            http_scheme = "https"
+        elif scheme == "ws":
+            http_scheme = "http"
+        elif scheme in ("http", "https"):
+            http_scheme = scheme
+        else:
+            raise ConnectionError(f"Unsupported notifications hub URL scheme: {parsed.scheme}")
+
+        path = parsed.path or "/notifications/hub"
+        if not path.endswith("/"):
+            path += "/"
+        path += "negotiate"
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(key == "negotiateVersion" for key, _ in query_pairs):
+            query_pairs.append(("negotiateVersion", "1"))
+        query = urlencode(query_pairs, safe="", quote_via=quote)
+        return urlunparse((http_scheme, parsed.netloc, path, "", query, ""))
+
+    def _websocket_request_path(self, connection_id: str) -> str:
+        parsed = urlparse(self.server_url)
+        path = parsed.path or "/notifications/hub"
+        query_pairs = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "id"
+        ]
+        if connection_id:
+            query_pairs.append(("id", connection_id))
+        if self.token and not any(key == "access_token" for key, _ in query_pairs):
+            query_pairs.append(("access_token", self.token))
+        query = urlencode(query_pairs, safe="", quote_via=quote)
+        if query:
+            return f"{path}?{query}"
+        return path
+
+    def _negotiate(self) -> str:
+        """POST SignalR negotiate and return the connection id.
+
+        An empty string means the hub has no negotiate route and the WebSocket
+        upgrade itself joins the connection.
+        """
+        url = self._build_negotiate_url()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "text/plain;charset=UTF-8",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(url, data=b"", headers=headers, method="POST")
+        open_kwargs: Dict[str, Any] = {"timeout": 15}
+        if urlparse(url).scheme == "https":
+            open_kwargs["context"] = self._ssl_context()
+        try:
+            with urllib.request.urlopen(request, **open_kwargs) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+            finally:
+                exc.close()
+            if exc.code in (404, 405):
+                LOGGER.info(
+                    "SignalR negotiate returned HTTP %s; joining the notifications hub on the WebSocket upgrade",
+                    exc.code,
+                )
+                return ""
+            message = f"SignalR negotiate failed: HTTP {exc.code}"
+            if detail:
+                message = f"{message} {detail}"
+            raise ConnectionError(message) from exc
+        except urllib.error.URLError as exc:
+            raise ConnectionError(f"SignalR negotiate failed: {exc.reason}") from exc
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConnectionError("SignalR negotiate returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ConnectionError("SignalR negotiate response was not a JSON object")
+        connection_id = _connection_id_from_negotiate_payload(payload)
+        LOGGER.info("SignalR negotiate succeeded")
+        return connection_id
+
     def _create_connection(self) -> socket.socket:
+        connection_id = self._negotiate()
+        return self._open_websocket(connection_id)
+
+    def _open_websocket(self, connection_id: str) -> socket.socket:
+        self._recv_buf = b""
         parsed = urlparse(self.server_url)
         scheme = parsed.scheme.lower()
         is_ssl = scheme in ("wss", "https")
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if is_ssl else 80)
-        path = parsed.path or "/notifications/hub"
-        if parsed.query:
-            path += f"?{parsed.query}"
+        path = self._websocket_request_path(connection_id)
 
         raw_sock = socket.create_connection((host, port), timeout=15)
-        if is_ssl:
-            context = ssl.create_default_context()
-            if not self.ssl_verify:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            sock = context.wrap_socket(raw_sock, server_hostname=host)
-        else:
-            sock = raw_sock
+        sock: socket.socket = raw_sock
+        try:
+            if is_ssl:
+                sock = self._ssl_context().wrap_socket(raw_sock, server_hostname=host)
 
-        sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
-        headers = [
-            f"GET {path} HTTP/1.1",
-            f"Host: {host}:{port}",
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            f"Sec-WebSocket-Key: {sec_key}",
-            "Sec-WebSocket-Version: 13",
-        ]
-        if self.token:
-            headers.append(f"Authorization: Bearer {self.token}")
-        headers.extend(["", ""])
-        handshake_payload = "\r\n".join(headers).encode("ascii")
-        sock.sendall(handshake_payload)
+            sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+            headers = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {_format_host_header(host, port, is_ssl)}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {sec_key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            if self.token:
+                headers.append(f"Authorization: Bearer {self.token}")
+            headers.extend(["", ""])
+            sock.sendall("\r\n".join(headers).encode("ascii"))
 
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(1024)
-            if not chunk:
-                raise ConnectionError("Server closed connection during WebSocket handshake")
-            response += chunk
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Server closed connection during WebSocket handshake")
+                response += chunk
+                if len(response) > 65536:
+                    raise ConnectionError("WebSocket handshake response is too large")
 
-        first_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
-        if not (" 101 " in first_line or first_line.endswith(" 101")):
-            raise ConnectionError(f"WebSocket handshake rejected by server: {first_line}")
+            header_bytes, _, leftover = response.partition(b"\r\n\r\n")
+            first_line = header_bytes.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+            if " 101 " not in first_line and not first_line.endswith(" 101"):
+                raise ConnectionError(f"WebSocket handshake rejected by server: {first_line}")
 
-        return sock
+            # The first hub frame often shares a TCP packet with the 101 response.
+            self._recv_buf = leftover
+            sock.settimeout(None)
+            return sock
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
 
     def _send_ws_frame(self, sock: socket.socket, payload: bytes, opcode: int = 0x1) -> None:
         """Send a client-to-server masked WebSocket frame."""
@@ -2103,10 +2419,31 @@ class VaultwardenWebSocketClient:
         header.extend(mask_key)
         sock.sendall(header + masked_payload)
 
-    def _recv_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
+    def _recv_exact(self, sock: socket.socket, num_bytes: int, *, idle_first: bool = False) -> bytes:
+        """Read exactly num_bytes, consuming any bytes buffered from the 101 response.
+
+        The first byte of a new frame waits only for the keepalive interval.
+        A timeout there means the socket is idle. A timeout after any byte has
+        arrived means the frame was cut off.
+        """
         buf = bytearray()
         while len(buf) < num_bytes:
-            chunk = sock.recv(num_bytes - len(buf))
+            need = num_bytes - len(buf)
+            if self._recv_buf:
+                take = self._recv_buf[:need]
+                self._recv_buf = self._recv_buf[need:]
+                buf.extend(take)
+                continue
+            waiting_for_frame = idle_first and not buf
+            sock.settimeout(self.keepalive_interval if waiting_for_frame else 30)
+            try:
+                chunk = sock.recv(need)
+            except (TimeoutError, socket.timeout):
+                if waiting_for_frame:
+                    raise _SignalRIdle() from None
+                raise ConnectionError("Timed out while reading WebSocket frame") from None
+            finally:
+                sock.settimeout(None)
             if not chunk:
                 raise ConnectionError("Connection closed while reading WebSocket frame")
             buf.extend(chunk)
@@ -2114,7 +2451,7 @@ class VaultwardenWebSocketClient:
 
     def _recv_ws_frame(self, sock: socket.socket) -> Tuple[int, bytes]:
         """Receive a WebSocket frame (opcode, payload)."""
-        header = self._recv_exact(sock, 2)
+        header = self._recv_exact(sock, 2, idle_first=True)
         opcode = header[0] & 0x0F
         has_mask = bool(header[1] & 0x80)
         length = header[1] & 0x7F
@@ -2133,6 +2470,84 @@ class VaultwardenWebSocketClient:
 
         return opcode, payload
 
+    def _emit_notification(self, target: str, args: List[Any]) -> None:
+        LOGGER.info("Vaultwarden WebSocket event received: target=%s args=%s", target, args)
+        self.notification_count += 1
+        if self.metrics:
+            self.metrics.record_websocket_notification()
+        if self.on_notification:
+            try:
+                self.on_notification(target, args)
+            except Exception as exc:
+                LOGGER.error("Error in on_notification callback: %s", exc)
+
+    def _consume_json_messages(self, _sock: socket.socket, buffer: str) -> str:
+        while "\x1e" in buffer:
+            msg_str, buffer = buffer.split("\x1e", 1)
+            msg_str = msg_str.strip()
+            if not msg_str:
+                continue
+            try:
+                msg = json.loads(msg_str)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            # A handshake response is ``{}`` on success and ``{"error": "..."}``
+            # when the server rejects the selected protocol.
+            if msg.get("type") is None and "error" in msg:
+                detail = msg.get("error")
+                text = detail if isinstance(detail, str) and detail else "handshake failed"
+                raise ConnectionError(f"SignalR handshake rejected: {text}")
+            msg_type = msg.get("type")
+            if msg_type == 6:
+                # Protocol pings are not answered. Vaultwarden echoes any
+                # non-handshake frame, so a ping reply becomes a ping loop.
+                continue
+            if msg_type == 1:
+                target = msg.get("target", "")
+                args = msg.get("arguments", [])
+                if not isinstance(args, list):
+                    args = [args]
+                self._emit_notification(str(target), args)
+        return buffer
+
+    def _handle_msgpack_message(self, _sock: socket.socket, message: Any) -> None:
+        if not isinstance(message, list) or not message:
+            return
+        msg_type = message[0]
+        if msg_type == 6:
+            return
+        if msg_type != 1 or len(message) < 5:
+            return
+        target = message[3]
+        args = message[4] if isinstance(message[4], list) else []
+        self._emit_notification(target if isinstance(target, str) else str(target), args)
+
+    def _handle_binary_frame(self, sock: socket.socket, frame_data: bytes) -> None:
+        """Dispatch a binary SignalR frame.
+
+        Vaultwarden answers the JSON handshake with ``{}`` plus the record
+        separator in a binary frame. Notifications use MessagePack wrapped in
+        SignalR's binary length prefix.
+        """
+        try:
+            stripped = frame_data.strip()
+            if stripped.endswith(b"\x1e") and stripped[:1] in (b"{", b"["):
+                try:
+                    json.loads(stripped[:-1].strip().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                else:
+                    self._consume_json_messages(sock, frame_data.decode("utf-8", errors="replace"))
+                    return
+            for message in _iter_signalr_msgpack_messages(frame_data):
+                self._handle_msgpack_message(sock, message)
+        except ConnectionError:
+            raise
+        except Exception:
+            LOGGER.debug("Ignoring unrecognized SignalR binary frame")
+
     def _run_loop(self) -> None:
         backoff = self.reconnect_interval
         while self._running:
@@ -2148,43 +2563,30 @@ class VaultwardenWebSocketClient:
                 LOGGER.info("Vaultwarden WebSocket connected successfully")
                 backoff = self.reconnect_interval
 
-                # SignalR Handshake
-                signalr_handshake = json.dumps({"protocol": "json", "version": 1}) + "\x1e"
-                self._send_ws_frame(sock, signalr_handshake.encode("utf-8"), opcode=0x1)
+                # SignalR handshake is JSON text even when the hub protocol is MessagePack.
+                self._send_ws_frame(sock, _SIGNALR_HANDSHAKE, opcode=0x1)
 
                 buffer = ""
                 while self._running:
-                    opcode, frame_data = self._recv_ws_frame(sock)
+                    try:
+                        opcode, frame_data = self._recv_ws_frame(sock)
+                    except _SignalRIdle:
+                        if not self._running:
+                            break
+                        # ASP.NET SignalR drops a client that sends nothing for
+                        # ClientTimeoutInterval (30s). Vaultwarden resets its
+                        # 30s timer on any client frame, including this ping.
+                        self._send_ws_frame(sock, _signalr_msgpack_ping_frame(), opcode=0x2)
+                        continue
                     if opcode == 0x8:  # CLOSE
                         break
                     elif opcode == 0x9:  # PING
                         self._send_ws_frame(sock, frame_data, opcode=0xA)  # PONG
                     elif opcode == 0x1:  # TEXT
                         buffer += frame_data.decode("utf-8", errors="replace")
-                        while "\x1e" in buffer:
-                            msg_str, buffer = buffer.split("\x1e", 1)
-                            msg_str = msg_str.strip()
-                            if not msg_str:
-                                continue
-                            try:
-                                msg = json.loads(msg_str)
-                                msg_type = msg.get("type")
-                                if msg_type == 6:  # SignalR Ping
-                                    self._send_ws_frame(sock, b'{"type":6}\x1e', opcode=0x1)
-                                elif msg_type == 1:  # Invocation
-                                    target = msg.get("target", "")
-                                    args = msg.get("arguments", [])
-                                    LOGGER.info("Vaultwarden WebSocket event received: target=%s args=%s", target, args)
-                                    self.notification_count += 1
-                                    if self.metrics:
-                                        self.metrics.record_websocket_notification()
-                                    if self.on_notification:
-                                        try:
-                                            self.on_notification(target, args)
-                                        except Exception as exc:
-                                            LOGGER.error("Error in on_notification callback: %s", exc)
-                            except json.JSONDecodeError:
-                                pass
+                        buffer = self._consume_json_messages(sock, buffer)
+                    elif opcode == 0x2:  # BINARY
+                        self._handle_binary_frame(sock, frame_data)
             except Exception as exc:
                 if self._running:
                     LOGGER.warning("Vaultwarden WebSocket connection lost: %s (reconnecting in %.1fs)", exc, backoff)
@@ -2203,6 +2605,7 @@ class VaultwardenWebSocketClient:
             if self._running:
                 time.sleep(backoff)
                 backoff = min(backoff * 1.5, self.max_reconnect_interval)
+
 
 def parse_secret_path(path: str) -> Tuple[str, str, Optional[str]]:
     """Parse /v1/secret/{namespace}/{secret}/{key} or /v1/secret/{namespace}/{secret} path."""

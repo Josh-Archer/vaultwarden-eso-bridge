@@ -3000,6 +3000,56 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         )
         return False
 
+    def _get_caller_identity(self) -> Tuple[str, str, Optional[str]]:
+        """Return (caller, service_account, caller_namespace)."""
+        caller_sa = getattr(self, "caller_sa", None)
+        if not caller_sa or caller_sa == "authenticated_sa":
+            header = self.headers.get("Authorization", "")
+            presented = extract_bearer_token(header)
+            if self.token_review_authenticator and presented:
+                user = None
+                if hasattr(self.token_review_authenticator, "get_authenticated_user"):
+                    user = self.token_review_authenticator.get_authenticated_user(presented)
+                if not user:
+                    user = getattr(self.token_review_authenticator, "_last_user", None)
+                if not user:
+                    with getattr(self.token_review_authenticator, "_lock", threading.Lock()):
+                        cached = getattr(self.token_review_authenticator, "_cache", {}).get(presented)
+                        if cached and len(cached) >= 3 and cached[1] and cached[2]:
+                            user = cached[2]
+                if not user and hasattr(self.token_review_authenticator, "_review_token"):
+                    try:
+                        ok, uname = self.token_review_authenticator._review_token(presented)
+                        if ok and uname and self.token_review_authenticator.matches_service_account(uname):
+                            user = uname
+                    except Exception:
+                        pass
+                if user and user != "authenticated_sa":
+                    caller_sa = user
+                    self.caller_sa = user
+        if not caller_sa or caller_sa == "authenticated_sa":
+            return "token", "token", None
+
+        sa = caller_sa
+        ns = None
+        if sa.startswith("system:serviceaccount:"):
+            remainder = sa[len("system:serviceaccount:") :]
+            parts = remainder.split(":", 1)
+            ns = parts[0] if parts[0] else None
+            sa_name = parts[1] if len(parts) > 1 else parts[0]
+        elif ":" in sa:
+            parts = sa.split(":", 1)
+            ns = parts[0] if parts[0] else None
+            sa_name = parts[1] if len(parts) > 1 else parts[0]
+        elif "/" in sa:
+            parts = sa.split("/", 1)
+            ns = parts[0] if parts[0] else None
+            sa_name = parts[1] if len(parts) > 1 else parts[0]
+        else:
+            sa_name = sa
+
+        return caller_sa, sa_name, ns
+
     def _get_with_autogen(self, namespace: str, secret: str, key: Optional[str]):
         try:
             if key is None:
@@ -3085,6 +3135,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
             try:
                 namespace, secret, key = parse_secret_path(self.path)
+                caller, sa_name, caller_ns = self._get_caller_identity()
 
                 if not self._authorize_namespace(namespace, "read"):
                     status_code = HTTPStatus.FORBIDDEN
@@ -3093,6 +3144,15 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 if key is not None and key.startswith("attachment/"):
                     filename = key[len("attachment/") :]
                     content_bytes, mime = self.backend.get_attachment(namespace, secret, filename)
+                    LOGGER.info(
+                        "secret read succeeded item=%s/%s filename=%s caller=%s service_account=%s caller_namespace=%s",
+                        namespace,
+                        secret,
+                        filename,
+                        caller,
+                        sa_name,
+                        caller_ns or "-",
+                    )
                     accept_header = self.headers.get("Accept", "").lower()
                     if "application/octet-stream" in accept_header or "application/x-binary" in accept_header:
                         self._write_bytes(HTTPStatus.OK, content_bytes, mime)
@@ -3108,9 +3168,27 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         )
                 elif key is None:
                     values = self._get_with_autogen(namespace, secret, None)
+                    LOGGER.info(
+                        "secret read succeeded item=%s/%s keys=%s caller=%s service_account=%s caller_namespace=%s",
+                        namespace,
+                        secret,
+                        list(values.keys()),
+                        caller,
+                        sa_name,
+                        caller_ns or "-",
+                    )
                     self._write_json(HTTPStatus.OK, {"data": values, **values})
                 else:
                     value = self._get_with_autogen(namespace, secret, key)
+                    LOGGER.info(
+                        "secret read succeeded item=%s/%s key=%s caller=%s service_account=%s caller_namespace=%s",
+                        namespace,
+                        secret,
+                        key,
+                        caller,
+                        sa_name,
+                        caller_ns or "-",
+                    )
                     self._write_json(HTTPStatus.OK, {"value": value})
             except ValueError as exc:
                 status_code = HTTPStatus.BAD_REQUEST

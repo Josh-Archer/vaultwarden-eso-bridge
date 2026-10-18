@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.8.0...v0.9.0) (2026-10-18)
+
+
+### Features
+
+* log successful secret reads with the caller ([#63](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/63)) ([15f683a](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/15f683a0efa526b5577ce21d651d74cdec64fc40)), closes [#52](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/52)
+* **security:** limit which secrets each service account can read ([#61](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/61)) ([eeccdb7](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/eeccdb78e48b1748927579571b4815849ed96cb1))
+
 ## [0.8.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.7.1...v0.8.0) (2026-10-17)
 
 

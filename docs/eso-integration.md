@@ -240,11 +240,23 @@ To eliminate static shared `BRIDGE_TOKEN` secrets entirely:
      tokenReview:
        enabled: true
        allowedServiceAccounts:
-         - "system:serviceaccount:external-secrets:external-secrets"
+         # Scope cluster-wide ESO ServiceAccount across all namespaces:
+         - "system:serviceaccount:external-secrets:external-secrets=*"
+         # Or restrict to specific namespaces/folders (least privilege):
+         # - "system:serviceaccount:media:plex=media"
+         # - "monitoring:*=monitoring;infra"
+         # By default (without '=...'), a ServiceAccount may only read secrets in its own namespace.
        cacheTtlSeconds: 300
    ```
 2. Deploy `examples/08-clustersecretstore-tokenreview.yaml`, which sets `serviceAccountRef` on ESO's webhook provider. ESO automatically projects its short-lived ServiceAccount token to the bridge, and the bridge validates caller identity via the Kubernetes TokenReview API.
 3. In-pod TLS termination can be enabled with `tls.enabled: true` and `tls.existingSecret: <secret-name>` to encrypt traffic end-to-end between ESO and the bridge.
+
+### Least-privilege secret scoping
+
+In TokenReview mode, the bridge enforces least privilege on secret reads (`GET /v1/secret/{namespace}/{secret}...`):
+* **Default isolation**: A ServiceAccount listed without an explicit namespace assignment (for example `media:*` or `system:serviceaccount:media:plex`) can only read secrets belonging to its own namespace (`media`).
+* **Explicit permissions**: Append `=<ns1;ns2>` or `=*` to grant specific namespaces or wildcard access (for example `monitoring:*=monitoring;infra` or `sa=*`).
+* Requests for unauthorized namespaces are rejected with HTTP `403 Forbidden`.
 
 ## Declarative auto-generation (ExternalSecret annotations)
 

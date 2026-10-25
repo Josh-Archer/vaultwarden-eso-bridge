@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.0...v0.9.1) (2026-10-25)
+
+
+### Continuous Integration
+
+* pin GitHub Actions to commit SHAs and add least-privilege permissions ([#68](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/68)) ([3024b06](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/3024b0666f3faad887c0473797d442e969833183))
+
 ## [0.9.0](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.8.0...v0.9.0) (2026-10-18)
 
 

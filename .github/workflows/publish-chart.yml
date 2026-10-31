@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     outputs:
       version: ${{ steps.meta.outputs.version }}
       dry_run: ${{ steps.meta.outputs.dry_run }}
@@ -65,7 +65,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
   publish-image:
-    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs: prepare
     env:
       GHCR_USERNAME: ${{ github.actor }}
@@ -100,7 +100,7 @@ jobs:
           provenance: false
 
   publish:
-    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs:
       - prepare
       - publish-image

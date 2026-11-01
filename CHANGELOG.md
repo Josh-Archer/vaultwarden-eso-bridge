@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.1...v0.9.2) (2026-11-01)
+
+
+### Continuous Integration
+
+* run every job on the shared UECB runner pool ([#71](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/71)) ([7e7461e](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/7e7461ec5c8557eed02d4ec253c44c728c6e227a))
+
 ## [0.9.1](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.0...v0.9.1) (2026-10-25)
 
 

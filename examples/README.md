@@ -6,6 +6,9 @@ External Secrets Operator (ESO).
 Full walkthrough (mock mode, `bw-cli` mode, NetworkPolicy, token rotation):
 [docs/eso-integration.md](../docs/eso-integration.md).
 
+Supported ESO releases and the pinned `bw` CLI:
+[docs/compatibility.md](../docs/compatibility.md).
+
 | File | Description |
 | --- | --- |
 | `00-namespace.yaml` | Optional `secrets-platform` namespace |
@@ -16,7 +19,7 @@ Full walkthrough (mock mode, `bw-cli` mode, NetworkPolicy, token rotation):
 | `05-externalsecret-multi-key.yaml` | Multi-key `ExternalSecret` |
 | `06-externalsecret-bulk-datafrom.yaml` | Bulk multi-key `ExternalSecret` via `dataFrom.extract` |
 | `07-admin-cronjob.yaml` | Lightweight `curlimages/curl` CronJob for admin ensure/rotate |
-| `08-clustersecretstore-tokenreview.yaml` | Zero-shared-secret `ClusterSecretStore` via TokenReview SA auth |
+| `08-clustersecretstore-tokenreview.yaml` | TokenReview header sample. `serviceAccountRef` is outside the ESO webhook schema; see the compatibility matrix |
 | `09-bridge-bws-credentials.secret.yaml` | Bitwarden Secrets Manager machine access token (`BWS_ACCESS_TOKEN`) |
 | `10-pushsecret.yaml` | Bidirectional secret write-back via ESO `PushSecret` |
 | `11-externalsecret-autogenerate.yaml` | Auto-generate missing Vaultwarden items from ExternalSecret annotations |

@@ -7,6 +7,15 @@ The default chart image is a purpose-built container that already includes
 Python, Node.js, npm, and the pinned `bw` CLI version so the bridge does not
 perform package installs at pod startup.
 
+## Compatibility and 1.0
+
+Supported External Secrets Operator releases and `bw` CLI versions are listed
+in [docs/compatibility.md](docs/compatibility.md). That page is generated from
+`compat/matrix.json` and checked in CI.
+
+What must be true before tagging 1.0 is listed in
+[docs/v1-release-criteria.md](docs/v1-release-criteria.md).
+
 ## Security Defaults
 
 - Internal-only by default: chart `service.type` defaults to `ClusterIP`.
@@ -217,9 +226,13 @@ endpoint, but compose is the supported automated path.
 - `tests/integration`: optional Vaultwarden docker-compose integration harness
 - `scripts/test-eso-bridge-unit.sh`: unit test entrypoint
 - `scripts/test-eso-bridge-integration.sh`: optional real-Vaultwarden integration test
+- `scripts/check-compat-matrix.sh`: ESO and `bw` CLI compatibility check
 - `scripts/publish-secrets-platform-bridge-chart.sh`: OCI publish helper
 - `docs/eso-integration.md`: ESO integration walkthrough
+- `docs/compatibility.md`: supported ESO and `bw` CLI versions
+- `docs/v1-release-criteria.md`: gates for the 1.0 tag
 - `docs/secrets-platform-extraction.md`: standalone extraction guidance
+- `compat/matrix.json`: source of truth for the compatibility matrix
 - `CHECKLIST.md`: first external-repo bootstrap and release checklist
 
 ## Container image platforms

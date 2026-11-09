@@ -30,6 +30,28 @@ jobs:
       - name: Run bridge unit tests
         run: bash scripts/test-eso-bridge-unit.sh
 
+  compat:
+    name: compatibility matrix
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Check ESO and bw CLI compatibility matrix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/check-compat-matrix.sh
+
   integration:
     name: integration (real Vaultwarden)
     # Optional path: mock/unit stays the default CI gate.

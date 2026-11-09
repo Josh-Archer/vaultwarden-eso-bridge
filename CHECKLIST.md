@@ -59,3 +59,17 @@ git push origin "vaultwarden-eso-bridge-v${RELEASE_VERSION}"
 ```bash
 helm pull "oci://ghcr.io/${GHCR_REPOSITORY}/vaultwarden-eso-bridge" --version "${RELEASE_VERSION}"
 ```
+
+## Compatibility and 1.0
+
+Supported External Secrets Operator and `bw` CLI versions:
+[docs/compatibility.md](docs/compatibility.md).
+
+Gates that must be true before tagging 1.0:
+[docs/v1-release-criteria.md](docs/v1-release-criteria.md).
+
+Check the matrix locally (needs network; installs each listed `bw` CLI and does not log in):
+
+```bash
+./scripts/check-compat-matrix.sh
+```

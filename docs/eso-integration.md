@@ -6,7 +6,9 @@ rotation.
 
 ## Prerequisites
 
-- Kubernetes cluster with [External Secrets Operator](https://external-secrets.io/) installed
+- Kubernetes cluster with [External Secrets Operator](https://external-secrets.io/) installed.
+  Supported releases and the `bw` CLI pin are in the [compatibility matrix](compatibility.md).
+  Example manifests use `external-secrets.io/v1`, which ESO serves from 0.16.0.
 - Helm 3
 - This repository (chart + examples)
 - For `bw-cli` mode: a reachable Vaultwarden/Bitwarden server and an account
@@ -248,7 +250,7 @@ To eliminate static shared `BRIDGE_TOKEN` secrets entirely:
          # By default (without '=...'), a ServiceAccount may only read secrets in its own namespace.
        cacheTtlSeconds: 300
    ```
-2. Deploy `examples/08-clustersecretstore-tokenreview.yaml`, which sets `serviceAccountRef` on ESO's webhook provider. ESO automatically projects its short-lived ServiceAccount token to the bridge, and the bridge validates caller identity via the Kubernetes TokenReview API.
+2. Register the store with `examples/03-clustersecretstore.yaml` (a Secret labeled `external-secrets.io/type: webhook`). The bridge validates a ServiceAccount token when the caller puts one in the `Authorization` header. The [compatibility matrix](compatibility.md) lists the webhook fields the checked ESO releases actually serve. `examples/08-clustersecretstore-tokenreview.yaml` sets `webhook.serviceAccountRef`, which those CRDs omit, so the apiserver drops that field on apply.
 3. In-pod TLS termination can be enabled with `tls.enabled: true` and `tls.existingSecret: <secret-name>` to encrypt traffic end-to-end between ESO and the bridge.
 
 ### Least-privilege secret scoping

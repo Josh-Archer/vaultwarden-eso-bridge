@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.2...v0.9.3) (2026-11-09)
+
+
+### Documentation
+
+* add ESO and bw CLI compatibility matrix and 1.0 criteria ([#73](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/73)) ([a668a38](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/a668a38bbe6c336ea3f3f379ddb12b8581529d48)), closes [#70](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/70)
+
 ## [0.9.2](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.1...v0.9.2) (2026-11-01)
 
 

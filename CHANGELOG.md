@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.3...v0.9.4) (2026-11-14)
+
+
+### Bug Fixes
+
+* **ci:** use dedicated release automation token ([#81](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/81)) ([42a2639](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/42a2639cd1a63bf8800f87a1b9da23a590cbc00f))
+
 ## [0.9.3](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.2...v0.9.3) (2026-11-09)
 
 

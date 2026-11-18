@@ -363,6 +363,170 @@ class BridgeUnitTests(unittest.TestCase):
             )
         warn_mock.assert_not_called()
 
+    def test_token_matches_each_variant_form_legacy(self):
+        """Every legacy variant form the expansion produces must keep authorizing."""
+        configured = "abc123"
+        b64 = "YWJjMTIz"  # base64("abc123")
+        accepted = [
+            "abc123",  # exact
+            '"abc123"',  # double-quoted
+            "'abc123'",  # single-quoted
+            b64,  # base64 of configured
+            f'"{b64}"',  # double-quoted base64
+            f"'{b64}'",  # single-quoted base64
+            "  abc123  ",  # padded raw (stripped variant)
+            f"  {b64}  ",  # padded base64
+        ]
+        for presented in accepted:
+            with self.subTest(presented=presented, legacy=True):
+                self.assertTrue(
+                    bridge.token_matches(configured, presented, legacy_variants=True)
+                )
+        rejected = ["abc124", "abc12", "abc1234", '"abc124"', "YWJjMTI0", "", None, "\u00e9bc123"]
+        for presented in rejected:
+            with self.subTest(presented=presented, legacy=True):
+                self.assertFalse(
+                    bridge.token_matches(configured, presented, legacy_variants=True)
+                )
+
+    def test_token_matches_each_variant_form_strict(self):
+        """With legacy variants off only the exact value matches."""
+        configured = "abc123"
+        b64 = "YWJjMTIz"
+        for presented in ['"abc123"', "'abc123'", b64, f'"{b64}"', "  abc123  "]:
+            with self.subTest(presented=presented, legacy=False):
+                self.assertFalse(
+                    bridge.token_matches(configured, presented, legacy_variants=False)
+                )
+        self.assertTrue(bridge.token_matches(configured, "abc123", legacy_variants=False))
+
+    def test_token_matches_configured_with_quotes_or_base64_exact(self):
+        """A configured value that itself looks like a variant still matches exactly."""
+        self.assertTrue(bridge.token_matches('"abc"', '"abc"', legacy_variants=False))
+        self.assertTrue(bridge.token_matches("YWJjMTIz", "YWJjMTIz", legacy_variants=False))
+        self.assertTrue(bridge.token_matches("YWJjMTIz", "YWJjMTIz", legacy_variants=True))
+
+    def test_token_matches_non_ascii_does_not_raise(self):
+        self.assertTrue(bridge.token_matches("p\u00e4ss", "p\u00e4ss", legacy_variants=True))
+        self.assertFalse(bridge.token_matches("pass", "p\u00e4ss", legacy_variants=True))
+        self.assertFalse(bridge.token_matches("p\u00e4ss", "pass", legacy_variants=False))
+
+    def test_token_matches_uses_constant_time_compare_over_all_variants(self):
+        """No early exit: every variant is compared even when the first matches."""
+        configured = "abc123"
+        presented = '"YWJjMTIz"'
+        expected = len(bridge.expand_token_variants(presented))
+        self.assertGreaterEqual(expected, 3)
+        real = bridge.hmac.compare_digest
+        with patch.object(bridge.hmac, "compare_digest", side_effect=real) as cmp_mock:
+            self.assertTrue(bridge.token_matches(configured, presented, legacy_variants=True))
+        self.assertEqual(cmp_mock.call_count, expected + 1)  # exact + each variant
+        for call in cmp_mock.call_args_list:
+            self.assertTrue(all(isinstance(a, bytes) for a in call.args))
+        with patch.object(bridge.hmac, "compare_digest", side_effect=real) as cmp_mock:
+            self.assertTrue(bridge.token_matches(configured, "abc123", legacy_variants=False))
+        self.assertEqual(cmp_mock.call_count, 1)
+
+    def test_tokenreview_cache_keyed_by_sha256_not_raw_token(self):
+        import hashlib
+
+        auth = bridge.TokenReviewAuthenticator(
+            ["system:serviceaccount:external-secrets:external-secrets"],
+            cache_ttl_seconds=60,
+            negative_cache_ttl_seconds=10,
+        )
+        token = "super-secret-sa-jwt"
+        with patch.object(
+            auth,
+            "_review_token",
+            return_value=(True, "system:serviceaccount:external-secrets:external-secrets"),
+        ) as review:
+            self.assertTrue(auth.authenticate(token))
+            self.assertTrue(auth.authenticate(token))
+        self.assertEqual(review.call_count, 1)
+        self.assertNotIn(token, auth._cache)
+        self.assertIn(hashlib.sha256(token.encode("utf-8")).hexdigest(), auth._cache)
+
+    def test_bw_session_not_on_argv_but_in_env(self):
+        backend = self._make_bw_backend()
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            backend._run_bw_raw(["list", "items"])
+        command = run_mock.call_args.args[0]
+        self.assertNotIn("--session", command)
+        self.assertNotIn("preseeded-session", command)
+        self.assertEqual(run_mock.call_args.kwargs["env"]["BW_SESSION"], "preseeded-session")
+
+    def _body_handler(self, headers, data=b""):
+        import io
+
+        class _H(bridge.BridgeRequestHandler):
+            def __init__(self):
+                self.headers = headers
+                self.rfile = io.BytesIO(data)
+
+        return _H()
+
+    def test_read_body_valid_and_missing_length(self):
+        self.assertEqual(self._body_handler({"Content-Length": "5"}, b"hello")._read_body(), b"hello")
+        self.assertEqual(self._body_handler({}, b"")._read_body(), b"")
+        self.assertEqual(self._body_handler({"Content-Length": "0"}, b"")._read_body(), b"")
+
+    def test_read_body_rejects_bad_content_length_with_400(self):
+        for value in ["abc", "-1", "1.5", ""]:
+            with self.subTest(value=value):
+                with self.assertRaises(bridge.RequestBodyError) as ctx:
+                    self._body_handler({"Content-Length": value})._read_body()
+                self.assertEqual(ctx.exception.status, 400)
+
+    def test_read_body_rejects_oversized_with_413(self):
+        too_big = str(bridge.MAX_REQUEST_BODY_BYTES + 1)
+        with self.assertRaises(bridge.RequestBodyError) as ctx:
+            self._body_handler({"Content-Length": too_big})._read_body()
+        self.assertEqual(ctx.exception.status, 413)
+
+    def test_read_body_short_read_is_400(self):
+        with self.assertRaises(bridge.RequestBodyError) as ctx:
+            self._body_handler({"Content-Length": "10"}, b"abc")._read_body()
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_read_body_socket_timeout_is_408(self):
+        class _Slow:
+            def read(self, n):
+                raise socket.timeout("timed out")
+
+        h = self._body_handler({"Content-Length": "10"})
+        h.rfile = _Slow()
+        with self.assertRaises(bridge.RequestBodyError) as ctx:
+            h._read_body()
+        self.assertEqual(ctx.exception.status, 408)
+
+    def test_handler_has_socket_read_timeout(self):
+        self.assertIsNotNone(bridge.BridgeRequestHandler.timeout)
+        self.assertGreater(bridge.BridgeRequestHandler.timeout, 0)
+
+    def test_post_oversized_content_length_returns_413(self):
+        backend = bridge.MockBackend(secrets={})
+        handler = bridge.BridgeRequestHandler
+        handler.token = "t"
+        handler.backend = backend
+        handler.token_legacy_variants = False
+        responses = []
+
+        class _H(bridge.BridgeRequestHandler):
+            def __init__(self):
+                self.path = "/v1/secret/ns/name/key"
+                self.headers = {
+                    "Authorization": "Bearer t",
+                    "Content-Length": str(bridge.MAX_REQUEST_BODY_BYTES + 1),
+                }
+
+            def _write_json(self, status, payload):
+                responses.append((int(status), payload))
+
+        _H().do_POST()
+        self.assertEqual(responses[-1][0], 413)
+
     def test_build_config_defaults_legacy_variants_off(self):
         with patch.dict(
             os.environ,
@@ -940,7 +1104,7 @@ class BridgeUnitTests(unittest.TestCase):
         bootstrap_mock.assert_called_once()
         self.assertEqual(run_mock.call_count, 2)
 
-    def test_bw_cli_backend_uses_explicit_session_flag(self):
+    def test_bw_cli_backend_passes_session_via_env_not_argv(self):
         with patch.object(bridge.BwCliBackend, "_run_bw_raw", return_value=""):
             with patch.object(bridge.BwCliBackend, "_validate_session", return_value=True):
                 backend = bridge.BwCliBackend(
@@ -967,7 +1131,8 @@ class BridgeUnitTests(unittest.TestCase):
             backend._run_bw_raw(["list", "items"])
 
         command = run_mock.call_args.args[0]
-        self.assertEqual(command[-2:], ["--session", "preseeded-session"])
+        self.assertEqual(command, ["bw", "list", "items"])
+        self.assertEqual(run_mock.call_args.kwargs["env"]["BW_SESSION"], "preseeded-session")
 
     def test_bw_cli_backend_unlocks_when_already_logged_in(self):
         with patch.object(

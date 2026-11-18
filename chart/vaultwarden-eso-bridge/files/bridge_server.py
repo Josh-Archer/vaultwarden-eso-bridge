@@ -1283,8 +1283,9 @@ class BwCliBackend(SecretBackend):
             return False
         try:
             stdout = self._run_bw_raw(
-                ["list", "items", "--search", "__bridge_session_probe__", "--session", session],
+                ["list", "items", "--search", "__bridge_session_probe__"],
                 include_session=False,
+                extra_env={"BW_SESSION": session},
             )
             parsed = json.loads(stdout)
         except (BridgeError, json.JSONDecodeError):

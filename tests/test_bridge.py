@@ -447,6 +447,16 @@ class BridgeUnitTests(unittest.TestCase):
         self.assertNotIn(token, auth._cache)
         self.assertIn(hashlib.sha256(token.encode("utf-8")).hexdigest(), auth._cache)
 
+    def test_bw_validate_session_probe_uses_env_not_argv(self):
+        backend = self._make_bw_backend()
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            self.assertTrue(backend._validate_session("candidate-session"))
+        command = run_mock.call_args.args[0]
+        self.assertNotIn("--session", command)
+        self.assertNotIn("candidate-session", command)
+        self.assertEqual(run_mock.call_args.kwargs["env"]["BW_SESSION"], "candidate-session")
+
     def test_bw_session_not_on_argv_but_in_env(self):
         backend = self._make_bw_backend()
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")

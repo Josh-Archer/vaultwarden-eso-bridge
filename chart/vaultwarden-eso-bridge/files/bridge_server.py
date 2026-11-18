@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import hashlib
+import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -511,9 +513,11 @@ class TokenReviewAuthenticator:
         if not token:
             return None
         now = time.time()
+        # Key the cache on a digest so live SA tokens are not retained in memory.
+        cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
         if self.cache_ttl_seconds > 0 or self.negative_cache_ttl_seconds > 0:
             with self._lock:
-                cached = self._cache.get(token)
+                cached = self._cache.get(cache_key)
                 if cached and cached[0] > now:
                     return cached[2] if cached[1] else None
 
@@ -523,7 +527,7 @@ class TokenReviewAuthenticator:
         ttl = self.cache_ttl_seconds if allowed else self.negative_cache_ttl_seconds
         if ttl > 0:
             with self._lock:
-                self._cache[token] = (now + ttl, allowed, username)
+                self._cache[cache_key] = (now + ttl, allowed, username)
 
         user = username if allowed else None
         if allowed:
@@ -1202,8 +1206,7 @@ class BwCliBackend(SecretBackend):
         tolerate_failure: bool = False,
     ) -> str:
         command = [self.bw_path, *args]
-        if include_session and self.session and "--session" not in args:
-            command.extend(["--session", self.session])
+        # The session is passed via BW_SESSION only; argv is visible in /proc.
         env = os.environ.copy()
         if include_session and self.session:
             env["BW_SESSION"] = self.session
@@ -1280,8 +1283,9 @@ class BwCliBackend(SecretBackend):
             return False
         try:
             stdout = self._run_bw_raw(
-                ["list", "items", "--search", "__bridge_session_probe__", "--session", session],
+                ["list", "items", "--search", "__bridge_session_probe__"],
                 include_session=False,
+                extra_env={"BW_SESSION": session},
             )
             parsed = json.loads(stdout)
         except (BridgeError, json.JSONDecodeError):
@@ -2778,12 +2782,19 @@ def token_matches(
     """Return True when the presented bearer token authorizes the request."""
     if presented is None or not configured:
         return False
-    if presented == configured:
-        return True
+    configured_bytes = configured.encode("utf-8")
+    exact = hmac.compare_digest(presented.encode("utf-8"), configured_bytes)
     if not legacy_variants:
-        return False
-    variants = expand_token_variants(presented)
-    if configured in variants:
+        return exact
+    # Compare every variant without early exit so timing does not reveal
+    # which form (if any) matched.
+    variant_match = False
+    for variant in expand_token_variants(presented):
+        if hmac.compare_digest(variant.encode("utf-8"), configured_bytes):
+            variant_match = True
+    if exact:
+        return True
+    if variant_match:
         LOGGER.warning(
             "bridge token matched via legacy variant expansion "
             "(presented form differed from BRIDGE_TOKEN); "
@@ -2911,8 +2922,25 @@ def build_backend(config: BridgeConfig) -> SecretBackend:
     raise RuntimeError(f"Unsupported BACKEND_MODE: {config.backend_mode}")
 
 
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+REQUEST_SOCKET_TIMEOUT_SECONDS = 30
+
+
+class RequestBodyError(Exception):
+    """Raised when the request body cannot be read safely."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class BridgeRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for secret lookups."""
+
+    # Applied to the connection socket by StreamRequestHandler.setup(), so a
+    # slow or stalled client cannot pin a handler thread indefinitely.
+    timeout = REQUEST_SOCKET_TIMEOUT_SECONDS
 
     token: str = ""
     token_legacy_variants: bool = False
@@ -2950,10 +2978,26 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", 0))
-        if length <= 0:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
             return b""
-        return self.rfile.read(length)
+        try:
+            length = int(str(raw_length).strip())
+        except ValueError:
+            raise RequestBodyError(400, "invalid Content-Length") from None
+        if length < 0:
+            raise RequestBodyError(400, "invalid Content-Length")
+        if length == 0:
+            return b""
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyError(413, "request body too large")
+        try:
+            data = self.rfile.read(length)
+        except (TimeoutError, socket.timeout):
+            raise RequestBodyError(408, "request body read timed out") from None
+        if len(data) < length:
+            raise RequestBodyError(400, "request body shorter than Content-Length")
+        return data
 
     def _authorized(self) -> bool:
         self.auth_type = ""
@@ -3261,7 +3305,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
 
-            raw = self._read_body()
+            try:
+                raw = self._read_body()
+            except RequestBodyError as exc:
+                status_code = exc.status
+                self.close_connection = True
+                self._write_json(exc.status, {"error": exc.message})
+                return
             if not raw:
                 status_code = HTTPStatus.BAD_REQUEST
                 self._write_json(HTTPStatus.BAD_REQUEST, {"error": "empty request body"})

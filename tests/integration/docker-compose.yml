@@ -69,6 +69,16 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - ../../chart/vaultwarden-eso-bridge/files/bridge_server.py:/app/bridge_server.py:ro
+    # Mirror the chart's restricted defaults so the bw login/unlock/sync path
+    # is exercised under a read-only root filesystem as a non-root user.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /data:uid=10001,gid=10001,mode=0700
+      - /tmp:uid=10001,gid=10001,mode=1777
     ports:
       - "${BRIDGE_HOST_PORT:-18081}:8080"
     networks:

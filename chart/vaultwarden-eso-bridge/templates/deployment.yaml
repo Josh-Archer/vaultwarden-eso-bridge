@@ -16,11 +16,19 @@ spec:
         app.kubernetes.io/name: vaultwarden-eso-bridge
     spec:
       serviceAccountName: {{ default "vaultwarden-eso-bridge" .Values.serviceAccount.name }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+{{ toYaml . | indent 8 }}
+      {{- end }}
       containers:
         - name: bridge
           image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python", "/app/bridge_server.py"]
+          {{- with .Values.securityContext }}
+          securityContext:
+{{ toYaml . | indent 12 }}
+          {{- end }}
           env:
             - name: BRIDGE_PORT
               value: "{{ .Values.service.port }}"
@@ -185,6 +193,10 @@ spec:
             - name: bridge-script
               mountPath: /app
               readOnly: true
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           {{- if and .Values.tls.enabled .Values.tls.existingSecret }}
             - name: tls-certs
               mountPath: /etc/tls
@@ -197,6 +209,12 @@ spec:
           configMap:
             name: vaultwarden-eso-bridge-script
             defaultMode: 0555
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.writableVolumes.sizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.writableVolumes.sizeLimit }}
       {{- if and .Values.tls.enabled .Values.tls.existingSecret }}
         - name: tls-certs
           secret:

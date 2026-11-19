@@ -1,10 +1,21 @@
 name: Publish Helm Chart
 
 on:
-  push:
-    tags:
-      - "vaultwarden-eso-bridge-v*"
-      - "v*"
+  # Called by release-please.yml after a release is created. A failure here
+  # fails that caller because the caller job uses needs. workflow_dispatch
+  # remains for a maintainer backfill (for example version 0.9.2). Tag pushes
+  # are not a trigger: the release token would start a second publish.
+  workflow_call:
+    inputs:
+      version:
+        description: "Optional semver override (for example 0.1.2 or v0.1.2)"
+        required: false
+        type: string
+      dry_run:
+        description: "Package/lint only; skip GHCR push"
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:

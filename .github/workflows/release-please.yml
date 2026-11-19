@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write
 
 concurrency:
   group: release-please
@@ -17,6 +16,9 @@ concurrency:
 jobs:
   release-please:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - name: Require release automation credential
         env:
@@ -30,4 +32,16 @@ jobs:
           config-file: .github/release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # The release token allows the tag push to trigger publish-chart.yml.
+  # Same-repo reusable workflow. A failed publish fails this run via needs.
+  # No gh CLI and no actions: write. Tag-push publish is not used, because
+  # RELEASE_PLEASE_TOKEN tag pushes would otherwise publish a second time.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-chart.yml
+    with:
+      version: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit

@@ -1,0 +1,9 @@
+{
+  "name": "bw-cli-pin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pins the Bitwarden CLI installed in the bridge image. package-lock.json is the integrity source.",
+  "dependencies": {
+    "@bitwarden/cli": "2025.12.0"
+  }
+}

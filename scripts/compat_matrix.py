@@ -121,7 +121,7 @@ def render_markdown(matrix: dict) -> str:
         "log in and does not talk to Vaultwarden. Vaultwarden coverage is the opt-in integration",
         "test for the image pin only.",
         "",
-        "The bridge image bakes one CLI (`Dockerfile` `BW_CLI_VERSION`). Helm",
+        "The bridge image bakes one CLI (`bw-cli/package.json`, hashes in `bw-cli/package-lock.json`). Helm",
         "`backend.bwCli.cliVersion` records that pin. The chart does not install a",
         "different CLI when the value changes. Pin locations: {paths}.".format(paths=pin_paths),
         "",

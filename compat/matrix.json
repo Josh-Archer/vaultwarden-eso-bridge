@@ -86,8 +86,8 @@
   },
   "pin_checks": [
     {
-      "path": "Dockerfile",
-      "regex": "BW_CLI_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)"
+      "path": "bw-cli/package.json",
+      "regex": "\"@bitwarden/cli\":\\s*\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
     },
     {
       "path": "chart/vaultwarden-eso-bridge/values.yaml",
@@ -98,8 +98,8 @@
       "regex": "cliVersion:\\s*\"([0-9]+\\.[0-9]+\\.[0-9]+)\""
     },
     {
-      "path": ".github/workflows/publish-chart.yml",
-      "regex": "BW_CLI_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)"
+      "path": "bw-cli/package-lock.json",
+      "regex": "\"node_modules/@bitwarden/cli\": \\{\\s*\"version\": \"([0-9]+\\.[0-9]+\\.[0-9]+)\""
     }
   ],
   "doc_links": [

@@ -16,7 +16,7 @@ A break in that contract is a major release.
 
 ## Required before the 1.0 tag
 
-1. **Matrix CI is green.** `scripts/check-compat-matrix.sh` passes on the release commit. The script checks that every External Secrets release and `@bitwarden/cli` version in `compat/matrix.json` still exists, that each release manifest still serves the APIs the matrix names, that example manifests still use those APIs, and that the image pin matches the Dockerfile, chart values, example values, and publish workflow. The CI job installs each listed `bw` CLI and checks help text for the commands the bridge runs.
+1. **Matrix CI is green.** `scripts/check-compat-matrix.sh` passes on the release commit. The script checks that every External Secrets release and `@bitwarden/cli` version in `compat/matrix.json` still exists, that each release manifest still serves the APIs the matrix names, that example manifests still use those APIs, and that the image pin matches `bw-cli/package.json`, the lockfile, chart values, and example values. The CI job installs each listed `bw` CLI and checks help text for the commands the bridge runs.
 2. **Unit tests pass.** `scripts/test-eso-bridge-unit.sh` is green on that commit.
 3. **Vaultwarden integration has run on the candidate.** `scripts/test-eso-bridge-integration.sh` has passed on the 1.0 commit against the pinned `bw` CLI and the Vaultwarden image named in the matrix (`vaultwarden/server:1.34.3`). Link that Actions run in the release pull request. Ordinary pushes keep this job opt-in (`workflow_dispatch` input `run_integration`) because it needs Docker.
 4. **Docs point here.** README and CHECKLIST link this page and the compatibility matrix.

@@ -3,6 +3,9 @@ replicaCount: 1
 image:
   repository: ghcr.io/josh-archer/vaultwarden-eso-bridge
   tag: ""
+  # Optional immutable image digest (sha256:...). When set it takes precedence
+  # over the tag; the tag is then informational only.
+  digest: ""
   pullPolicy: IfNotPresent
 
 service:

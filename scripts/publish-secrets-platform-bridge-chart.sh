@@ -73,8 +73,9 @@ if [[ ! "${PACKAGE_APP_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+
   exit 1
 fi
 
-echo "Linting bridge chart..."
-helm lint "${CHART_DIR}"
+# Same render gate as the tests workflow job `chart` and publish-chart.yml.
+echo "Linting and rendering bridge chart..."
+bash "${REPO_ROOT}/scripts/lint-chart.sh"
 
 mkdir -p "${OUTPUT_DIR}"
 echo "Packaging bridge chart version ${PACKAGE_VERSION} with appVersion ${PACKAGE_APP_VERSION}..."

@@ -238,3 +238,5 @@ endpoint, but compose is the supported automated path.
 ## Container image platforms
 
 Published bridge images are multi-arch (`linux/amd64` and `linux/arm64`) as of chart `0.1.8`.
+
+The image build is hardened for supply-chain integrity: the base image is pinned by digest, the Bitwarden CLI installs from a lockfile with `npm ci --ignore-scripts`, and published images carry SLSA provenance and an SBOM attestation. To pin a deployment to an exact image, set `image.digest` (for example `sha256:...`); it takes precedence over `image.tag`.

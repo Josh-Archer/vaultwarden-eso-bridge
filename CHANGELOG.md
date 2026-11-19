@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.5](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.4...v0.9.5) (2026-11-19)
+
+
+### Bug Fixes
+
+* **bridge:** constant-time token compare, bw session off argv, bounded request body ([#83](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/83)) ([4345c8a](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/4345c8a82e91150b22a3121708259a8ff0d8f971))
+* **ci:** call publish-chart from release-please via workflow_call ([#87](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/87)) ([8d7115e](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/8d7115e074e5f31e3fc89b98f24316995c6798a6)), closes [#75](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/75)
+
+
+### Build System
+
+* pin base image by digest, lock bw CLI install, enable provenance and SBOM ([#85](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/85)) ([221a760](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/221a760dee8caa5398f3d83dd894568153bb4a5d))
+
+
+### Continuous Integration
+
+* **tests:** lint and render the Helm chart on pull requests ([#89](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/89)) ([eab3b9c](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/eab3b9c2269a8edc02350e0315427115e14c58a2))
+
 ## [0.9.4](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.3...v0.9.4) (2026-11-14)
 
 

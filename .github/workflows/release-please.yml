@@ -21,6 +21,9 @@ jobs:
     # annotation was "This workflow run required approval but was not approved
     # before it expired" on pull_request events opened by app/github-actions.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       # App installation must be this repository only.
       # Secrets (Actions secrets on Josh-Archer/vaultwarden-eso-bridge):
@@ -59,5 +62,16 @@ jobs:
           config-file: .github/release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # The app token pushes the tag, which starts publish-chart.yml.
-      # Token is revoked when this job ends (create-github-app-token post step).
+  # Same-repo reusable workflow. A failed publish fails this run via needs.
+  # No gh CLI and no actions: write. Tag-push publish is not used, because
+  # a release-token tag push would otherwise publish a second time.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-chart.yml
+    with:
+      version: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit

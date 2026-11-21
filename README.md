@@ -193,6 +193,18 @@ behavior. These are the default gate and do not require Docker or Vaultwarden:
 ./scripts/test-eso-bridge-unit.sh
 ```
 
+### Chart lint and render (default CI)
+
+`scripts/lint-chart.sh` runs `helm lint`, then `helm template` for every `examples/values-*.yaml` (glob, so a new example is rendered automatically) and for flag combinations: tokenReview, dual, tls, networkPolicy, serviceMonitor, PrometheusRule, autoGenerate, and the tokenReview plus autoGenerate pair. Output goes through pinned `kubeconform` `v0.8.0` with `-strict`, pinned External Secrets and Prometheus Operator CRD schemas, and no `-ignore-missing-schemas`.
+
+`helm template` must exit non-zero for `service.type` of `NodePort` or `LoadBalancer` unless `exposure.allowExternalService=true`. The script asserts that failure.
+
+```bash
+./scripts/lint-chart.sh
+```
+
+The GitHub Actions check name is `chart` (job `chart` in `.github/workflows/test.yml`). It is not a required status check. `publish-chart.yml` and `scripts/publish-secrets-platform-bridge-chart.sh` call the same script.
+
 ### Integration tests (optional, real Vaultwarden)
 
 Optional docker-compose stack that stands up a real Vaultwarden with TLS, seeds
@@ -224,6 +236,7 @@ endpoint, but compose is the supported automated path.
 - `examples`: end-to-end ESO webhook and ExternalSecret samples
 - `tests`: bridge unit/contract tests
 - `tests/integration`: optional Vaultwarden docker-compose integration harness
+- `scripts/lint-chart.sh`: helm lint, template, and kubeconform gate (CI check `chart`)
 - `scripts/test-eso-bridge-unit.sh`: unit test entrypoint
 - `scripts/test-eso-bridge-integration.sh`: optional real-Vaultwarden integration test
 - `scripts/check-compat-matrix.sh`: ESO and `bw` CLI compatibility check

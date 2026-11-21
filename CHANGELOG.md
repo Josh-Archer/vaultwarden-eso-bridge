@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.6](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.5...v0.9.6) (2026-11-21)
+
+
+### Continuous Integration
+
+* open release-please PRs with a repo-scoped GitHub App ([#88](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/88)) ([b91c735](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/b91c735778dbe72565bd924ff9f2b1c74a23b575))
+
 ## [0.9.5](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.4...v0.9.5) (2026-11-19)
 
 

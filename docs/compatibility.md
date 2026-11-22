@@ -83,7 +83,7 @@ token is a Secret labeled `external-secrets.io/type: webhook`, as in
 | 2025.12.0 | no | Previously exercised with Vaultwarden 1.34.3. Current CI checks npm metadata and CLI help. |
 | 2025.12.1 | no | npm metadata and CLI help only. No Vaultwarden login. |
 | 2026.10.1 | no | npm metadata and CLI help only, on Node 22 or newer (package engines). |
-| 2026.11.0 | yes | Opt-in CI runs scripts/test-eso-bridge-integration.sh against vaultwarden/server:1.34.3. |
+| 2026.11.0 | yes | Opt-in CI runs scripts/test-eso-bridge-integration.sh against vaultwarden/server:1.37.5. Password login against Vaultwarden 1.34.3 fails because it lacks /identity/accounts/prelogin/password. |
 
 Commands the bridge runs: `config`, `login`, `unlock`, `sync`, `list`, `get`, `create`, `edit`, `delete`.
 Login and unlock use `--passwordenv` plus the global `--raw` flag.
@@ -91,7 +91,7 @@ Login and unlock use `--passwordenv` plus the global `--raw` flag.
 `bw get attachment --itemid --output`. Create, edit, and delete pass
 base64 JSON that the bridge encodes itself (`bw encode` is not required).
 
-Integration image: `vaultwarden/server:1.34.3` in `tests/integration/docker-compose.yml`.
+Integration image: `vaultwarden/server:1.37.5` in `tests/integration/docker-compose.yml`.
 The compose bridge service builds the Dockerfile, so it runs the pinned CLI.
 
 ## Example manifests

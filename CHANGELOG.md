@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.7](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.6...v0.9.7) (2026-11-22)
+
+
+### Bug Fixes
+
+* patch Bitwarden CLI dependencies and gate vulnerabilities ([#92](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/92)) ([2928ec5](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/2928ec5f3358af5af8eb9fa22a9b64c621104f87))
+
 ## [0.9.6](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.5...v0.9.6) (2026-11-21)
 
 

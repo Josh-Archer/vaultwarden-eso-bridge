@@ -4,6 +4,11 @@
   "private": true,
   "description": "Pins the Bitwarden CLI installed in the bridge image. package-lock.json is the integrity source.",
   "dependencies": {
-    "@bitwarden/cli": "2025.12.0"
+    "@bitwarden/cli": "2026.11.0"
+  },
+  "overrides": {
+    "node-forge": "1.4.3",
+    "multer": "2.5.0",
+    "tmp": "0.2.7"
   }
 }

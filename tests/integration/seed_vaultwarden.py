@@ -148,9 +148,17 @@ def register_user(
         encryption_algorithm=serialization.NoEncryption(),
     )
 
+    registration_url = f"{base_url.rstrip('/')}/identity/accounts/register"
+    _status, verification = _request(
+        f"{registration_url}/send-verification-email",
+        method="POST",
+        data=json.dumps({"email": email_n, "name": name}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        insecure=insecure,
+    )
     payload = {
         "email": email_n,
-        "name": name,
+        "emailVerificationToken": json.loads(verification),
         "masterPasswordHash": master_password_hash,
         "masterPasswordHint": None,
         "key": _encrypt(user_key, stretched),
@@ -164,7 +172,7 @@ def register_user(
         },
     }
     _request(
-        f"{base_url.rstrip('/')}/api/accounts/register",
+        f"{registration_url}/finish",
         method="POST",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
@@ -214,8 +222,15 @@ def create_item(
     login_password: str,
     insecure: bool,
 ) -> None:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    _status, profile = _request(
+        f"{base_url.rstrip('/')}/api/accounts/profile",
+        headers=headers,
+        insecure=insecure,
+    )
     cipher = {
         "type": 1,
+        "encryptedFor": json.loads(profile)["id"],
         "name": _encrypt_str(item_name, user_key),
         "notes": None,
         "favorite": False,
@@ -247,10 +262,7 @@ def create_item(
         f"{base_url.rstrip('/')}/api/ciphers",
         method="POST",
         data=json.dumps(cipher).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}",
-        },
+        headers={**headers, "Content-Type": "application/json"},
         insecure=insecure,
     )
 

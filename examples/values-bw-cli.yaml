@@ -29,7 +29,7 @@ backend:
     folderName: "k8s-secrets"
   bwCli:
     enabled: true
-    cliVersion: "2025.12.0"
+    cliVersion: "2026.11.0"
     existingSecret: eso-bridge-bw
     serverKey: BW_SERVER
     emailKey: BW_EMAIL

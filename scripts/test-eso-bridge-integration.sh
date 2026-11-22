@@ -97,6 +97,14 @@ until curl -fsS "http://127.0.0.1:${BRIDGE_HOST_PORT}/healthz" >/dev/null 2>&1; 
   sleep 2
 done
 
+echo "==> Assert the bridge runs the pinned bw CLI"
+expected_bw_version="$("${PYTHON_BIN}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dependencies"]["@bitwarden/cli"])' "${REPO_ROOT}/bw-cli/package.json")"
+actual_bw_version="$(docker compose -f "${COMPOSE_FILE}" exec -T bridge bw --version)"
+if [[ "${actual_bw_version}" != "${expected_bw_version}" ]]; then
+  echo "ERROR: expected bw CLI ${expected_bw_version}, got ${actual_bw_version}" >&2
+  exit 1
+fi
+
 echo "==> Assert unauthorized without bearer token"
 status="$(curl -sS -o /tmp/bridge-int-unauth.json -w '%{http_code}' \
   "http://127.0.0.1:${BRIDGE_HOST_PORT}/v1/secret/default/demo-secret/api-key")"

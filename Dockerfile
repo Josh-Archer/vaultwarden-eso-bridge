@@ -6,6 +6,8 @@ FROM python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff308
 # and bw-cli/package-lock.json (single source of truth for the pin).
 # Install scripts are disabled; if a dependency ever needs a postinstall step,
 # allow it for that package by name rather than dropping --ignore-scripts.
+# The bridge uses the Python standard library, so remove pip's bundled
+# dependencies and the ensurepip wheel that can reinstall them.
 COPY bw-cli/package.json bw-cli/package-lock.json /opt/bw-cli/
 
 RUN apk add --no-cache nodejs npm \
@@ -13,7 +15,9 @@ RUN apk add --no-cache nodejs npm \
     && npm ci --ignore-scripts --omit=dev --no-audit --no-fund \
     && ln -s /opt/bw-cli/node_modules/.bin/bw /usr/local/bin/bw \
     && npm cache clean --force \
-    && bw --version >/dev/null
+    && bw --version >/dev/null \
+    && python -m pip uninstall -y pip \
+    && rm -rf /usr/local/lib/python3.14/ensurepip
 
 # Run as a fixed non-root user. The bw CLI keeps its state (and HOME/npm
 # caches) under /data, which the chart mounts as an emptyDir so the root

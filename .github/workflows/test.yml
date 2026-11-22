@@ -69,6 +69,38 @@ jobs:
       - name: Lint and render chart
         run: bash scripts/lint-chart.sh
 
+  security:
+    name: bw CLI and image vulnerability gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Scan bw CLI production lockfile
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.2
+          scan-type: fs
+          scan-ref: bw-cli/package-lock.json
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          cache: 'false'
+
+      - name: Build bridge image locally
+        run: docker build --tag eso-bridge-security:local .
+
+      - name: Scan built bridge image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-setup-trivy: 'true'
+          scan-type: image
+          image-ref: eso-bridge-security:local
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          cache: 'false'
+
   integration:
     name: integration (real Vaultwarden)
     # Optional path: mock/unit stays the default CI gate.

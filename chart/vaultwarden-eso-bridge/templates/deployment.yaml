@@ -134,6 +134,8 @@ spec:
               value: "{{ .Values.backend.bwCli.itemCacheTtlSeconds }}"
             - name: BW_NEGATIVE_CACHE_TTL_SECONDS
               value: "{{ .Values.backend.bwCli.negativeCacheTtlSeconds | default 15 }}"
+            - name: DUPLICATE_ITEM_POLICY
+              value: {{ .Values.backend.bwCli.duplicateItemPolicy | default "error" | quote }}
             - name: BW_COMMAND_TIMEOUT_SECONDS
               value: "{{ .Values.backend.bwCli.commandTimeoutSeconds }}"
           {{- end }}

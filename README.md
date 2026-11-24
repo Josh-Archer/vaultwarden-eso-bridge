@@ -85,6 +85,19 @@ Primary override points:
 - `resources` for CPU/memory constraints
 - `backend.bwCli.itemCacheTtlSeconds` for optional hot-key caching (see below)
 
+## Duplicate Item Names
+
+In `bw-cli` mode the bridge reads the item whose name exactly matches
+`remoteRef.key` (after the organization and folder filters). If more than one
+visible item has that exact name, the bridge answers `409` with code
+`duplicate_item` and lists the item ids (never values), so the ExternalSecret
+fails with a clear error instead of syncing whichever copy `bw` lists first.
+Keep one item with that name (trash or rename the others).
+
+| Setting | Env | Default | Notes |
+| --- | --- | --- | --- |
+| `backend.bwCli.duplicateItemPolicy` | `DUPLICATE_ITEM_POLICY` | `error` | `first` restores the old first-match read and logs a warning |
+
 ## Optional Hot-Key Cache (TTL)
 
 In `bw-cli` mode the bridge can keep a short in-process cache of resolved

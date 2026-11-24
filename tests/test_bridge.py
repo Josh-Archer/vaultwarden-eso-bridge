@@ -1071,6 +1071,73 @@ class BridgeUnitTests(unittest.TestCase):
             with self.assertRaises(bridge.SecretLookupError):
                 backend._select_item(items[:2], "media/plex")
 
+    def test_bw_cli_select_item_errors_on_duplicate_exact_names(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        items = [
+            {"id": "copy-a", "name": "media/plex"},
+            {"id": "fuzzy", "name": "media/plex-old"},
+            {"id": "copy-b", "name": "media/plex"},
+        ]
+        with self.assertRaises(bridge.DuplicateItemError) as ctx:
+            backend._select_item(items, "media/plex")
+        self.assertNotIsInstance(ctx.exception, bridge.SecretLookupError)
+        self.assertEqual(ctx.exception.code, "duplicate_item")
+        self.assertIn("copy-a", str(ctx.exception))
+        self.assertIn("copy-b", str(ctx.exception))
+
+    def test_bw_cli_select_item_duplicates_outside_org_filter_are_ignored(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        backend.org_id = "org-1"
+        items = [
+            {"id": "other-org", "name": "media/plex", "organizationId": "org-other"},
+            {"id": "match", "name": "media/plex", "organizationId": "org-1"},
+        ]
+        self.assertEqual(backend._select_item(items, "media/plex")["id"], "match")
+
+    def test_bw_cli_select_item_first_policy_returns_first_duplicate(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        backend.duplicate_item_policy = "first"
+        items = [
+            {"id": "copy-a", "name": "media/plex"},
+            {"id": "copy-b", "name": "media/plex"},
+        ]
+        with self.assertLogs(bridge.LOGGER, level="WARNING"):
+            selected = backend._select_item(items, "media/plex")
+        self.assertEqual(selected["id"], "copy-a")
+
+    def test_bw_cli_lookup_does_not_sync_or_negative_cache_duplicates(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        backend.negative_cache_ttl_seconds = 60
+        dupes = [{"id": "copy-a", "name": "media/plex"}, {"id": "copy-b", "name": "media/plex"}]
+        with patch.object(backend, "_run_bw_json", return_value=dupes), patch.object(
+            backend, "_run_bw_raw"
+        ) as run_raw_mock:
+            with self.assertRaises(bridge.DuplicateItemError):
+                backend._get_item_cached("media", "plex", "media/plex")
+        run_raw_mock.assert_not_called()
+        self.assertNotIn(("media", "plex"), backend._item_cache)
+
+    def test_bw_cli_ensure_item_does_not_create_another_copy_on_duplicates(self):
+        backend = self._make_bw_backend(cache_ttl_seconds=0)
+        dupes = [{"id": "copy-a", "name": "media/plex"}, {"id": "copy-b", "name": "media/plex"}]
+        with patch.object(backend, "_run_bw_json", return_value=dupes), patch.object(
+            backend, "_run_bw_raw"
+        ) as run_raw_mock:
+            with self.assertRaises(bridge.DuplicateItemError):
+                backend.ensure_item("media/plex", {"password": ""})
+        for call in run_raw_mock.call_args_list:
+            self.assertNotEqual(call.args[0][:1], ["create"])
+
+    def test_duplicate_item_policy_env(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DUPLICATE_ITEM_POLICY", None)
+            self.assertEqual(bridge.parse_duplicate_item_policy_env(), "error")
+        with patch.dict(os.environ, {"DUPLICATE_ITEM_POLICY": "First"}):
+            self.assertEqual(bridge.parse_duplicate_item_policy_env(), "first")
+        with patch.dict(os.environ, {"DUPLICATE_ITEM_POLICY": "newest"}):
+            with self.assertRaises(RuntimeError):
+                bridge.parse_duplicate_item_policy_env()
+
     def test_bw_cli_lookup_does_not_return_fuzzy_search_hit(self):
         backend = self._make_bw_backend(cache_ttl_seconds=0)
         with patch.object(

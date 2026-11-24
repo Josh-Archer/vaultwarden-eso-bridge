@@ -72,6 +72,20 @@ class SecretLookupError(BridgeError):
     code = "secret_not_found"
 
 
+class DuplicateItemError(BridgeError):
+    """Raised when more than one visible item has the exact requested name.
+
+    Deliberately not a SecretLookupError: callers that treat "not found" as
+    "create it" must not create yet another copy, and the miss path must not
+    negative-cache or re-sync on it.
+    """
+
+    code = "duplicate_item"
+
+
+DUPLICATE_ITEM_POLICIES = ("error", "first")
+
+
 class AuthError(BridgeError):
     """Raised on authentication or authorization failure with Vaultwarden."""
 
@@ -771,6 +785,7 @@ class BridgeConfig:
         bw_item_cache_ttl_seconds: int,
         bw_command_timeout_seconds: int,
         bw_negative_cache_ttl_seconds: int = 15,
+        bw_duplicate_item_policy: str = "error",
         bws_access_token: str = "",
         bws_server_url: str = "",
         bws_project_id: str = "",
@@ -812,6 +827,7 @@ class BridgeConfig:
         self.bw_path = bw_path
         self.bw_item_cache_ttl_seconds = bw_item_cache_ttl_seconds
         self.bw_negative_cache_ttl_seconds = bw_negative_cache_ttl_seconds
+        self.bw_duplicate_item_policy = bw_duplicate_item_policy
         self.bw_command_timeout_seconds = bw_command_timeout_seconds
         self.bws_access_token = bws_access_token
         self.bws_server_url = bws_server_url
@@ -1161,7 +1177,13 @@ class BwCliBackend(SecretBackend):
         command_timeout_seconds: int,
         metrics: Optional[AuthMetrics] = None,
         negative_cache_ttl_seconds: int = 15,
+        duplicate_item_policy: str = "error",
     ):
+        if duplicate_item_policy not in DUPLICATE_ITEM_POLICIES:
+            raise ValueError(
+                f"duplicate_item_policy must be one of {DUPLICATE_ITEM_POLICIES}, got {duplicate_item_policy!r}"
+            )
+        self.duplicate_item_policy = duplicate_item_policy
         self.bw_path = bw_path
         self.folder_name = folder_name
         self.org_id = org_id
@@ -1379,7 +1401,7 @@ class BwCliBackend(SecretBackend):
             raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
 
         folder_id = self._resolve_folder_id()
-        selected = None
+        matches = []
         for item in items:
             if item.get("name") != item_name:
                 continue
@@ -1387,12 +1409,29 @@ class BwCliBackend(SecretBackend):
                 continue
             if folder_id and item.get("folderId") != folder_id:
                 continue
-            selected = item
-            break
+            matches.append(item)
 
-        if selected is None:
+        if not matches:
             raise SecretLookupError(f"Vaultwarden item '{item_name}' not found")
-        return selected
+        if len(matches) > 1:
+            # Item ids are not secret; they let an operator find the copies.
+            ids = ", ".join(str(m.get("id") or "?") for m in matches)
+            if self.duplicate_item_policy == "error":
+                raise DuplicateItemError(
+                    f"{len(matches)} Vaultwarden items are named '{item_name}' ({ids})",
+                    hint=(
+                        "Keep one item with this exact name (trash or rename the others), "
+                        "or set DUPLICATE_ITEM_POLICY=first to restore first-match reads."
+                    ),
+                )
+            LOGGER.warning(
+                "duplicate Vaultwarden items name=%s count=%d ids=%s; returning the first match "
+                "(DUPLICATE_ITEM_POLICY=first)",
+                item_name,
+                len(matches),
+                ids,
+            )
+        return matches[0]
 
     def _lookup_item(self, item_name: str) -> Dict:
         """Fetch a Vaultwarden item by name, syncing once on miss."""
@@ -2805,6 +2844,16 @@ def token_matches(
     return False
 
 
+def parse_duplicate_item_policy_env() -> str:
+    """Read DUPLICATE_ITEM_POLICY: `error` (default) or `first`."""
+    raw = os.getenv("DUPLICATE_ITEM_POLICY", "").strip().lower() or "error"
+    if raw not in DUPLICATE_ITEM_POLICIES:
+        raise RuntimeError(
+            f"DUPLICATE_ITEM_POLICY must be one of {', '.join(DUPLICATE_ITEM_POLICIES)}; got {raw!r}"
+        )
+    return raw
+
+
 def build_config_from_env() -> BridgeConfig:
     """Build BridgeConfig from environment."""
     token = os.getenv("BRIDGE_TOKEN", "").strip()
@@ -2850,6 +2899,7 @@ def build_config_from_env() -> BridgeConfig:
         bw_item_cache_ttl_seconds=parse_non_negative_int_env("BW_ITEM_CACHE_TTL_SECONDS", 0),
         bw_command_timeout_seconds=parse_positive_int_env("BW_COMMAND_TIMEOUT_SECONDS", 120),
         bw_negative_cache_ttl_seconds=parse_non_negative_int_env("BW_NEGATIVE_CACHE_TTL_SECONDS", 15),
+        bw_duplicate_item_policy=parse_duplicate_item_policy_env(),
         bws_access_token=os.getenv("BWS_ACCESS_TOKEN", "").strip(),
         bws_server_url=os.getenv("BWS_SERVER_URL", "").strip(),
         bws_project_id=os.getenv("BWS_PROJECT_ID", "").strip(),
@@ -2908,6 +2958,7 @@ def build_backend(config: BridgeConfig) -> SecretBackend:
             cache_ttl_seconds=config.bw_item_cache_ttl_seconds,
             command_timeout_seconds=config.bw_command_timeout_seconds,
             negative_cache_ttl_seconds=config.bw_negative_cache_ttl_seconds,
+            duplicate_item_policy=config.bw_duplicate_item_policy,
         )
     if config.backend_mode == "bws":
         return BwsBackend(
@@ -3259,6 +3310,18 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._write_json(
                     HTTPStatus.BAD_GATEWAY,
+                    {"error": str(exc), "code": exc.code, "hint": exc.hint},
+                )
+            except DuplicateItemError as exc:
+                status_code = HTTPStatus.CONFLICT
+                LOGGER.error(
+                    "duplicate item path=%s code=%s error=%s",
+                    self.path,
+                    exc.code,
+                    exc.log_message(),
+                )
+                self._write_json(
+                    HTTPStatus.CONFLICT,
                     {"error": str(exc), "code": exc.code, "hint": exc.hint},
                 )
             except SecretLookupError as exc:

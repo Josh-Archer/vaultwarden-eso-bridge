@@ -78,6 +78,11 @@ backend:
     # Default 15s prevents hammering Vaultwarden when ExternalSecrets request
     # missing secrets during reconciliation loops. 0 disables negative caching.
     negativeCacheTtlSeconds: 15
+    # What to do when more than one visible item has the exact requested name.
+    # "error" (default): answer 409 duplicate_item so the ExternalSecret fails
+    # loudly instead of syncing whichever copy bw lists first.
+    # "first": old behaviour, return the first match and log a warning.
+    duplicateItemPolicy: error
     commandTimeoutSeconds: 120
     startupProbe:
       enabled: true

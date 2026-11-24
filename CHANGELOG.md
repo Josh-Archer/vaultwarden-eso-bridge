@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.8](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.7...v0.9.8) (2026-11-24)
+
+
+### Bug Fixes
+
+* **bw-cli:** error on duplicate exact-name items instead of reading the first match ([#94](https://github.com/Josh-Archer/vaultwarden-eso-bridge/issues/94)) ([6b00644](https://github.com/Josh-Archer/vaultwarden-eso-bridge/commit/6b00644ea424d2b515024b5f500df3dc58518302))
+
 ## [0.9.7](https://github.com/Josh-Archer/vaultwarden-eso-bridge/compare/v0.9.6...v0.9.7) (2026-11-22)
 
 
